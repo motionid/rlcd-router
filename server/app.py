@@ -22,6 +22,7 @@ from router.classifier import RouterClassifier, bypass_classification
 from router.policy import choose_route
 from router.telemetry import TelemetryLog
 from router.config import TIER_DEFINITIONS, MODEL_PROFILES, CONFIDENCE_THRESHOLDS
+from router.fallback import recommend_subscription_fallback
 
 app = FastAPI(title="RLCD Multi-Model Router")
 
@@ -102,6 +103,11 @@ class OutcomeReport(BaseModel):
     actual_model: str = ""
     latency_ms: float = 0.0
     cost: float = 0.0
+
+
+class FallbackRecommendationRequest(BaseModel):
+    current_model: str
+    eligible_models: list[str] = Field(default_factory=list)
 
 
 def _get_router_classifier() -> RouterClassifier:
@@ -238,6 +244,7 @@ def api_route(req: RouteRequest):
                 critical_confidence=1.0,
                 abstain=False,
                 selected_tier=tier,
+                eligible_models=list(decision.eligible_models),
                 reasons=["user_requested_model", f"override:{profile_name}"],
                 requirements=req_obj.to_dict(),
                 classifier_latency_ms=0.0,
@@ -288,6 +295,7 @@ def api_route(req: RouteRequest):
             critical_confidence=cls_result.critical_confidence,
             abstain=cls_result.abstain,
             selected_tier=decision.tier,
+            eligible_models=list(decision.eligible_models),
             reasons=list(decision.reasons),
             requirements=decision.requirements.to_dict(),
             classifier_latency_ms=cls_result.latency_ms,
@@ -306,14 +314,18 @@ def api_route(req: RouteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _profile_name_for_model(model: str) -> str:
+    if model in MODEL_PROFILES:
+        return model
+    for name, profile in MODEL_PROFILES.items():
+        if profile.model_id == model:
+            return name
+    return model
+
+
 @app.post("/api/route/outcome")
 def api_report_outcome(report: OutcomeReport):
-    """Report the outcome of a routing decision.
-
-    PI calls this after the chosen model completes (or fails) to
-    provide feedback for telemetry and escalation decisions.
-    """
-    # Find the event and update it
+    """Report an outcome and recommend a switch when a subscription is exhausted."""
     for event in _telemetry_log.events:
         if event.event_id == report.event_id:
             event.status = report.status
@@ -322,10 +334,29 @@ def api_report_outcome(report: OutcomeReport):
             event.actual_model = report.actual_model
             event.latency_ms += report.latency_ms
             event.cost += report.cost
-            _telemetry_log.record(event)  # re-record with updates
-            return {"status": "recorded", "event_id": report.event_id}
+            _telemetry_log.record(event)
+
+            response = {"status": "recorded", "event_id": report.event_id}
+            if report.failure_reason == "subscription_exhausted":
+                response["model_switch"] = recommend_subscription_fallback(
+                    event.eligible_models,
+                    _profile_name_for_model(report.actual_model),
+                )
+            return response
 
     raise HTTPException(status_code=404, detail=f"event_id {report.event_id} not found")
+
+
+@app.post("/api/models/recommend")
+def api_recommend_fallback(req: FallbackRecommendationRequest):
+    """Return a switch prompt for a subscription that has run out."""
+    eligible = req.eligible_models or [
+        name for name, profile in MODEL_PROFILES.items() if profile.role == "executor"
+    ]
+    return recommend_subscription_fallback(
+        eligible,
+        _profile_name_for_model(req.current_model),
+    )
 
 
 @app.get("/api/route/config")
@@ -534,6 +565,7 @@ def api_route_and_execute(req: RouteAndExecuteRequest):
             critical_confidence=cls_result.critical_confidence,
             abstain=cls_result.abstain,
             selected_tier=decision.tier,
+            eligible_models=list(decision.eligible_models),
             reasons=list(decision.reasons),
             requirements=decision.requirements.to_dict(),
             classifier_latency_ms=cls_result.latency_ms,

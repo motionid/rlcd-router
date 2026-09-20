@@ -59,6 +59,20 @@ async function fetchOverrideModels(): Promise<Record<string, any[]> | null> {
   }
 }
 
+async function fetchFallbackRecommendation(currentModel: string): Promise<any | null> {
+  try {
+    const resp = await fetch(`${ROUTER_URL}/api/models/recommend`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_model: currentModel }),
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
 // ─── extension ─────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -177,6 +191,70 @@ export default function (pi: ExtensionAPI) {
         );
       } catch (e: any) {
         ctx.ui.notify(`Router unreachable: ${e.message}`, "error");
+      }
+    },
+  });
+
+  // ── Command: /model-exhausted — choose a subscription fallback ──
+
+  pi.registerCommand("model-exhausted", {
+    description:
+      "Choose a replacement when a model subscription is exhausted. Usage: /model-exhausted <profile>",
+    handler: async (args, ctx) => {
+      const currentModel = args.trim();
+      if (!currentModel) {
+        ctx.ui.notify("Usage: /model-exhausted <profile name or model id>", "info");
+        return;
+      }
+
+      const recommendation = await fetchFallbackRecommendation(currentModel);
+      if (!recommendation) {
+        ctx.ui.notify("Could not get a fallback recommendation from the router.", "error");
+        return;
+      }
+
+      const options: string[] = [];
+      if (recommendation.recommended) {
+        options.push(
+          `Use recommended: ${recommendation.recommended.profile_name} (${recommendation.recommended.model_id})`
+        );
+      }
+      for (const alternative of recommendation.alternatives ?? []) {
+        options.push(`Use alternative: ${alternative.profile_name} (${alternative.model_id})`);
+      }
+      options.push("Choose another model…");
+
+      const choice = await ctx.ui.select(
+        recommendation.message ?? "Subscription exhausted. Choose a replacement:",
+        options,
+      );
+      if (!choice) return;
+
+      let profileName: string | null = null;
+      if (choice.startsWith("Use recommended: ")) {
+        profileName = choice.slice("Use recommended: ".length).split(" ")[0];
+      } else if (choice.startsWith("Use alternative: ")) {
+        profileName = choice.slice("Use alternative: ".length).split(" ")[0];
+      } else {
+        const models = await fetchOverrideModels();
+        if (!models) {
+          ctx.ui.notify("Could not fetch available models from the router.", "error");
+          return;
+        }
+        const allOptions: string[] = [];
+        for (const billing of ["local", "subscription_unlimited", "subscription_quota", "paid"]) {
+          for (const model of models[billing] ?? []) {
+            allOptions.push(`${model.profile_name} (${model.provider}/${model.model_id}) [${billing}]`);
+          }
+        }
+        const selected = await ctx.ui.select("Choose a different model:", allOptions);
+        if (selected) profileName = selected.split(" ")[0];
+      }
+
+      if (profileName) {
+        modelOverride = profileName;
+        ctx.ui.setStatus("rlcd", `🧭 Override: ${profileName}`);
+        ctx.ui.notify(`Model override set: ${profileName}`, "info");
       }
     },
   });

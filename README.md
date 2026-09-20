@@ -188,7 +188,8 @@ It provides:
 - the `rlcd_classify` constrained-classification tool;
 - `/route <task>` to inspect a routing decision;
 - `/model-override` to select a one-shot override for the next `/route` inspection;
-- `/model-override clear` to return to automatic selection.
+- `/model-override clear` to return to automatic selection;
+- `/model-exhausted <profile>` to handle a subscription quota exhaustion, present the next-best model, and choose a different override if desired.
 
 ### Install using a symlink
 
@@ -226,6 +227,15 @@ export ROUTER_CORS_ORIGINS="http://127.0.0.1:3000,http://localhost:3000"
 ```
 
 > The included extension starts the service and exposes routing commands/tools. Execution remains the host agent's responsibility: it should resolve the selected profile to a configured provider/model and try `eligible_models` in order.
+
+## Subscription exhaustion
+
+Providers can report a quota exhaustion through `POST /api/route/outcome` using
+`failure_reason: "subscription_exhausted"`. The response includes `model_switch`
+with the recommended next model, alternatives, and `can_override: true`.
+
+The Pi extension also provides `/model-exhausted <profile>` to show an interactive
+replacement prompt. The selected model is applied as a one-shot override.
 
 ## Configuration
 

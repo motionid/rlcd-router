@@ -70,6 +70,7 @@ FAILURE_REASONS = frozenset({
     "schema_violation",
     "semantic_error",
     "scope_exceeded",
+    "subscription_exhausted",
 })
 
 

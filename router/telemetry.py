@@ -45,6 +45,7 @@ class RoutingEvent:
 
     # --- decision ---
     selected_tier: str = ""
+    eligible_models: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     requirements: dict[str, Any] = field(default_factory=dict)
 

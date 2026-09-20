@@ -209,6 +209,30 @@ class TestRouterAPI:
     # /api/route
     # ------------------------------------------------------------------
 
+    def test_subscription_exhaustion_returns_model_switch_recommendation(self):
+        import server.app as app_module
+
+        event = app_module._telemetry_log.new_event(
+            eligible_models=[
+                "claude_sonnet_4_6",
+                "gpt_5_6_sol",
+                "local_coding",
+            ]
+        )
+        app_module._telemetry_log.record(event)
+
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": event.event_id,
+            "status": "failed",
+            "failure_reason": "subscription_exhausted",
+            "actual_model": "claude_sonnet_4_6",
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["model_switch"]["recommended_model"] == "gpt_5_6_sol"
+        assert body["model_switch"]["can_override"] is True
+
     def test_route_honors_explicit_model_override(self):
         resp = self.client.post("/api/route", json={
             "prompt": "Review this migration plan",
