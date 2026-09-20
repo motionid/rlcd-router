@@ -2,6 +2,17 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+*.pyo
+.coverage
+htmlcov/
+.pyre/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
 *$py.class
 *.so
 .Python

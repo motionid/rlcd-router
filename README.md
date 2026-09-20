@@ -355,6 +355,11 @@ The tests mock model execution, so the routing suite does not load a large model
 - Model availability and subscription limits are host-specific; update `router/config.py` accordingly.
 - The default model profiles are examples and may refer to models not available from every provider.
 
+## Attribution
+
+This router builds on the RLCD model and engine work in the original
+[Qwen-2.5-1B-RLCD project by harshatheg](https://huggingface.co/harshatheg/Qwen-2.5-1B-RLCD).
+
 ## License
 
 Add the license appropriate for your project before publishing.
