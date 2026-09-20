@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# System and IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Isolated agent worktrees
+.worktrees/
+
+# Logs and runtime telemetry
+*.log
+data/*.jsonl
+
+# Local model caches if stored in-tree
+checkpoints/

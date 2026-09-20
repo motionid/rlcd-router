@@ -1,0 +1,88 @@
+{
+  "id": "pi_router",
+  "title": "PI Router Classification (11 Fields)",
+  "description": "Multi-model routing classification for PI coding harness. Classifies task requirements so a deterministic policy can select the minimum viable model tier.",
+  "context": "Fix the login endpoint in src/auth/handlers.py — it's returning 500 when the OAuth token expires. The error is in the try/catch block around line 47 where it calls token.verify(). I need the exact patch, tests must pass, and this is a production endpoint so don't break anything. Run python -m pytest tests/test_auth.py after the fix.",
+  "schema": {
+    "task_type": {
+      "type": "enum",
+      "choices": [
+        "code_edit",
+        "code_review",
+        "debugging",
+        "explanation",
+        "planning",
+        "research",
+        "extraction",
+        "classification",
+        "creative",
+        "operations",
+        "unknown"
+      ],
+      "description": "Primary task category"
+    },
+    "complexity": {
+      "type": "enum",
+      "choices": ["trivial", "low", "medium", "high", "critical"],
+      "description": "Minimum difficulty the task demands"
+    },
+    "coding": {
+      "type": "enum",
+      "choices": ["none", "light", "substantial", "dominant"],
+      "description": "How central code writing or editing is to the task"
+    },
+    "reasoning_depth": {
+      "type": "enum",
+      "choices": ["direct", "multi_step", "deep", "adversarial"],
+      "description": "How many reasoning steps or how much nuance the task needs"
+    },
+    "fresh_information": {
+      "type": "enum",
+      "choices": ["none", "useful", "required"],
+      "description": "Whether current web or external data is needed"
+    },
+    "repo_access": {
+      "type": "enum",
+      "choices": ["none", "inspect", "modify"],
+      "description": "What level of repository access the task requires"
+    },
+    "tool_use": {
+      "type": "enum",
+      "choices": ["none", "read_only", "shell", "browser", "multiple"],
+      "description": "What kind of tool calls the task will likely need"
+    },
+    "privacy": {
+      "type": "enum",
+      "choices": ["public", "ordinary", "sensitive", "local_only"],
+      "description": "Data sensitivity and whether local-only processing is required"
+    },
+    "latency": {
+      "type": "enum",
+      "choices": ["interactive", "normal", "asynchronous"],
+      "description": "How quickly the user expects a response"
+    },
+    "failure_cost": {
+      "type": "enum",
+      "choices": ["low", "medium", "high", "very_high"],
+      "description": "Consequence severity if the task produces a wrong result"
+    },
+    "output_contract": {
+      "type": "enum",
+      "choices": ["freeform", "structured", "exact_patch", "verified_artifact"],
+      "description": "How strictly the output must match a specific format or pass validation"
+    }
+  },
+  "expected": {
+    "task_type": "debugging",
+    "complexity": "low",
+    "coding": "dominant",
+    "reasoning_depth": "direct",
+    "fresh_information": "none",
+    "repo_access": "modify",
+    "tool_use": "shell",
+    "privacy": "ordinary",
+    "latency": "normal",
+    "failure_cost": "medium",
+    "output_contract": "exact_patch"
+  }
+}
