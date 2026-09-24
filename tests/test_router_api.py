@@ -214,7 +214,7 @@ class TestRouterAPI:
 
         event = app_module._telemetry_log.new_event(
             eligible_models=[
-                "claude_sonnet_4_6",
+                "claude_sonnet_5",
                 "gpt_5_6_sol",
                 "local_coding",
             ]
@@ -225,7 +225,7 @@ class TestRouterAPI:
             "event_id": event.event_id,
             "status": "failed",
             "failure_reason": "subscription_exhausted",
-            "actual_model": "claude_sonnet_4_6",
+            "actual_model": "claude_sonnet_5",
         })
 
         assert resp.status_code == 200
@@ -274,6 +274,25 @@ class TestRouterAPI:
         assert "local_coding" in profile_names
         assert "rlcd_smart" not in profile_names
         assert "rlcd_fast" not in profile_names
+
+    def test_route_config_exposes_catalog_invariants(self):
+        import router.config as config
+        assert config.MODEL_PROFILES["local_coding"].role == "executor"
+        assert config.MODEL_PROFILES["rlcd_smart"].role == "classifier"
+        assert config.MODEL_PROFILES["local_coding"].billing == "local"
+
+    def test_override_catalog_uses_supported_billing_order(self):
+        response = self.client.get("/api/models/overrides")
+        assert response.status_code == 200
+        body = response.json()
+        profile_names = {
+            model["profile_name"]
+            for models in body["models"].values()
+            for model in models
+        }
+        assert "rlcd_fast" not in profile_names
+        assert "rlcd_smart" not in profile_names
+        assert body["billing_order"] == ["local", "subscription_quota", "paid"]
 
     def test_route_basic(self):
         resp = self.client.post("/api/route", json={

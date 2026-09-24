@@ -4,8 +4,8 @@ from router.fallback import recommend_subscription_fallback
 
 def test_recommends_next_eligible_model_after_subscription_exhaustion():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_4_6", "gpt_5_6_sol", "local_coding"),
-        exhausted_model="claude_sonnet_4_6",
+        eligible_models=("claude_sonnet_5", "gpt_5_6_sol", "local_coding"),
+        exhausted_model="claude_sonnet_5",
     )
 
     assert result["reason"] == "subscription_exhausted"
@@ -16,8 +16,8 @@ def test_recommends_next_eligible_model_after_subscription_exhaustion():
 
 def test_does_not_recommend_the_exhausted_model_or_classifiers():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_4_6", "rlcd_smart", "local_coding"),
-        exhausted_model="claude_sonnet_4_6",
+        eligible_models=("claude_sonnet_5", "rlcd_smart", "local_coding"),
+        exhausted_model="claude_sonnet_5",
     )
 
     assert result["recommended_model"] == "local_coding"
@@ -36,8 +36,8 @@ def test_subscription_exhaustion_is_an_escalation_signal():
 
 def test_returns_no_recommendation_when_no_models_remain():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_4_6",),
-        exhausted_model="claude_sonnet_4_6",
+        eligible_models=("claude_sonnet_5",),
+        exhausted_model="claude_sonnet_5",
     )
 
     assert result["recommended_model"] is None

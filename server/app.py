@@ -646,7 +646,7 @@ def api_model_overrides():
             "notes": profile.notes,
         })
     return {
-        "billing_order": ["local", "subscription_unlimited", "subscription_quota", "paid"],
+        "billing_order": ["local", "subscription_quota", "paid"],
         "models": groups,
     }
 

@@ -12,6 +12,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# Local models already downloaded and managed by oMLX (see ~/.omlx/settings.json
+# -> model.model_dirs). Pointing model_id at these paths lets mlx_lm.load()
+# reuse the exact weights oMLX serves instead of re-downloading a duplicate
+# copy into ~/.cache/huggingface. Override with OMLX_MODELS_DIR if the layout
+# differs on another machine (e.g. a home machine with a different model set).
+OMLX_MODELS_DIR = os.getenv("OMLX_MODELS_DIR", os.path.expanduser("~/.omlx/models"))
+
+
 # ---------------------------------------------------------------------------
 # Model profiles – describes what each model *is* and what it can do
 # ---------------------------------------------------------------------------
@@ -23,7 +31,7 @@ class ModelProfile:
     provider: str                      # provider key used by the host agent
     capabilities: tuple[str, ...]      # e.g. ("coding", "tools")
     latency_class: str                 # "fast" | "medium" | "slow"
-    billing: str = "local"             # local | subscription_unlimited | subscription_quota | paid
+    billing: str = "local"             # local | subscription_quota | paid
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,32 +63,32 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     "rlcd_smart": ModelProfile(
         model_id=os.getenv(
             "RLCD_SMART_MODEL",
-            "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
         ),
         role="classifier",
         provider="omlx",
         capabilities=("classification", "routing", "coding", "reasoning"),
         latency_class="medium",
         billing="local",
-        notes="~0.5-1.6 s MoE, good for ambiguous or code-heavy tasks",
+        notes="~0.5-1.6 s MoE, good for ambiguous or code-heavy tasks. Shares weights with local_coding.",
     ),
     # ---- executors (models PI actually runs) ----
     "local_general": ModelProfile(
         model_id=os.getenv(
             "LOCAL_GENERAL_MODEL",
-            "Qwen3.8-27B-MTP-bf16",
+            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3.8-27B-4bit",
         ),
         role="executor",
         provider="omlx",
         capabilities=("general", "reasoning"),
         latency_class="slow",
         billing="local",
-        notes="Qwen3.8 27B MTP bf16 (General Reasoning)",
+        notes="Qwen3.8 27B 4bit (General Reasoning) - matches installed oMLX model",
     ),
     "local_coding": ModelProfile(
         model_id=os.getenv(
             "LOCAL_CODING_MODEL",
-            "Qwen3-Coder-30B-A3B-Instruct-4bit",
+            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
         ),
         role="executor",
         provider="omlx",
@@ -89,117 +97,186 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         billing="local",
         notes="Qwen3 Coder 30B MoE (Fast Local Coding)",
     ),
-    # ---- cloud subscriptions (UNLIMITED) ----
-    "gemini_3_8_flash": ModelProfile(
-        model_id="gemini-3.8-flash",
+    # NOTE: Ornith-1.5-35B-A3B-oQ4e-mtp (LookUpMark/Ornith-1.5-35B-A3B-oQ4e-mtp)
+    # is intentionally NOT registered as a router-executable profile. Its
+    # architecture (qwen3_5_moe: hybrid linear-attention MoE + MTP head) is
+    # only correctly implemented by oMLX's own server. The router's bundled
+    # backend (core/engine_mlx.py -> plain mlx_lm 0.31.3) loads it without
+    # erroring but produces incoherent/garbled output - verified by direct
+    # test. Only use Ornith through oMLX's HTTP API (e.g. Pi's "omlx"
+    # provider in models.json), never through this router's /api/execute.
+    # local_reasoning falls back to local_general below until mlx_lm ships
+    # native qwen3_5_moe support.
+    # ---- GitHub Copilot (single provider, single seat) ----
+    # All executor models below are served through the GitHub Copilot API
+    # (provider "github-copilot", see ~/.pi/agent/models-store.json for the
+    # live catalogue). Verified by decoding the live Copilot token's claims
+    # (~/.pi/agent/auth.json): sku="copilot_enterprise_seat_quota" - there is
+    # NO unlimited tier on this seat. Every model draws against the same
+    # metered enterprise quota, just at very different per-model multipliers
+    # (reflected here by the $/M-token notes). All profiles are therefore
+    # billing="subscription_quota"; ordering within each tier still puts the
+    # cheapest/lowest-multiplier models first to conserve quota.
+
+    # -- cheap / fast (routine work, treated as effectively unlimited) --
+    "gpt_6_luna": ModelProfile(
+        model_id="gpt-6-luna",
         role="executor",
-        provider="antigravity",
+        provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_unlimited",
-        notes="Google Gemini 3.8 Flash via Antigravity",
+        billing="subscription_quota",
+        notes="GPT-6 Luna via GitHub Copilot ($0.10 / $0.50) - cheapest general/coding model",
     ),
     "gpt_5_6_luna": ModelProfile(
         model_id="gpt-5.6-luna",
         role="executor",
-        provider="openai",
+        provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_unlimited",
-        notes="OpenAI GPT-5.6 Luna",
+        billing="subscription_quota",
+        notes="GPT-5.6 Luna via GitHub Copilot ($0.20 / $1.20)",
     ),
-    # ---- cloud subscriptions (STRICT QUOTA) ----
-    "gemini_3_1_pro": ModelProfile(
-        model_id="gemini-3.1-pro",
+    "gemini_3_8_flash": ModelProfile(
+        model_id="gemini-3.8-flash",
         role="executor",
-        provider="antigravity",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        provider="github-copilot",
+        capabilities=("general", "coding", "tools", "research"),
+        latency_class="fast",
+        billing="subscription_quota",
+        notes="Gemini 3.8 Flash via GitHub Copilot ($0.75 / $3.75, 1M context)",
+    ),
+    "gpt_5_mini": ModelProfile(
+        model_id="gpt-5-mini",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "tools"),
+        latency_class="fast",
+        billing="subscription_quota",
+        notes="GPT-5 Mini via GitHub Copilot ($0.25 / $2.00)",
+    ),
+    "claude_haiku_4_5": ModelProfile(
+        model_id="claude-haiku-4.5",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "tools"),
+        latency_class="fast",
+        billing="subscription_quota",
+        notes="Claude Haiku 4.5 via GitHub Copilot ($1.00 / $5.00)",
+    ),
+    "mai_code_1_1_flash": ModelProfile(
+        model_id="mai-code-1.1-flash",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("coding", "tools"),
+        latency_class="fast",
+        billing="subscription_quota",
+        notes="MAI-Code-1.1-Flash via GitHub Copilot ($0.20 / $1.20)",
+    ),
+
+    # -- coding specialists (moderate cost, reserve for real code work) --
+    "gpt_5_3_codex": ModelProfile(
+        model_id="gpt-5.3-codex",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("coding", "tools", "reasoning"),
         latency_class="medium",
         billing="subscription_quota",
-        notes="Google Gemini 3.1 Pro via Antigravity",
+        notes="GPT-5.3 Codex via GitHub Copilot ($1.75 / $14.00) - purpose-built coding model",
+    ),
+    "kimi_k2_7_code": ModelProfile(
+        model_id="kimi-k2.7-code",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("coding", "tools"),
+        latency_class="medium",
+        billing="subscription_quota",
+        notes="Kimi K2.7 Code via GitHub Copilot ($0.95 / $4.00)",
+    ),
+    "mai_code_1_flash": ModelProfile(
+        model_id="mai-code-1-flash-picker",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("coding", "tools"),
+        latency_class="medium",
+        billing="subscription_quota",
+        notes="MAI-Code-1-Flash via GitHub Copilot ($0.75 / $4.50)",
+    ),
+
+    # -- general reasoning / balanced (subscription quota) --
+    "claude_sonnet_5": ModelProfile(
+        model_id="claude-sonnet-5",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        latency_class="fast",
+        billing="subscription_quota",
+        notes="Claude Sonnet 5 via GitHub Copilot ($2.00 / $10.00)",
+    ),
+    "grok_4_7": ModelProfile(
+        model_id="grok-4.7",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "reasoning", "tools"),
+        latency_class="medium",
+        billing="subscription_quota",
+        notes="Grok 4.7 via GitHub Copilot ($2.00 / $6.00)",
     ),
     "gpt_5_6_sol": ModelProfile(
         model_id="gpt-5.6-sol",
         role="executor",
-        provider="openai",
+        provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="fast",
         billing="subscription_quota",
-        notes="OpenAI GPT-5.6 Sol",
+        notes="GPT-5.6 Sol via GitHub Copilot ($4.00 / $20.00)",
     ),
-    "claude_sonnet_4_6": ModelProfile(
-        model_id="claude-sonnet-4-6",
-        role="executor",
-        provider="antigravity",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="fast",
-        billing="subscription_quota",
-        notes="Anthropic Claude Sonnet 4.6 via Antigravity",
-    ),
-    # ---- cloud paid ----
-    "gpt_5_6_luna_paid": ModelProfile(
-        model_id="gpt-5.6-luna",
-        role="executor",
-        provider="openrouter",
-        capabilities=("general", "coding", "tools"),
-        latency_class="fast",
-        billing="paid",
-        notes="OpenAI Luna via OpenRouter ($0.20 / $1.20)",
-    ),
-    "qwen_3_8_max": ModelProfile(
-        model_id="qwen3.8-max",
-        role="executor",
-        provider="qwen-cloud",
-        capabilities=("general", "coding", "reasoning", "tools"),
-        latency_class="medium",
-        billing="paid",
-        notes="Qwen 3.8 Max ($2.00 / $6.00)",
-    ),
-    "qwen_3_7_max": ModelProfile(
-        model_id="qwen3.7-max",
-        role="executor",
-        provider="qwen-cloud",
-        capabilities=("general", "coding", "reasoning", "tools"),
-        latency_class="medium",
-        billing="paid",
-        notes="Qwen 3.7 Max ($1.48 / $4.43)",
-    ),
-    "claude_sonnet_5": ModelProfile(
-        model_id="claude-sonnet-5",
-        role="executor",
-        provider="openrouter",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="fast",
-        billing="paid",
-        notes="Anthropic Claude Sonnet 5 via OpenRouter ($2.00 / $10.00)",
-    ),
-    # ---- additional subscription models ----
-    "claude_opus_4_6": ModelProfile(
-        model_id="claude-opus-4-6",
-        role="executor",
-        provider="antigravity",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="slow",
-        billing="subscription_quota",
-        notes="Anthropic Claude Opus 4.6 via Antigravity",
-    ),
+
+    # -- deep reasoning / flagship (expensive, reserve for high failure cost) --
     "gpt_5_6_terra": ModelProfile(
         model_id="gpt-5.6-terra",
         role="executor",
-        provider="openai",
+        provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
         billing="subscription_quota",
-        notes="OpenAI GPT-5.6 Terra (deep reasoning)",
+        notes="GPT-5.6 Terra via GitHub Copilot ($2.00 / $12.00) - deep reasoning",
     ),
-    "gpt_oss_120b": ModelProfile(
-        model_id="gpt-oss-120b",
+    "claude_opus_5_5": ModelProfile(
+        model_id="claude-opus-5.5",
         role="executor",
-        provider="antigravity",
-        capabilities=("general", "coding", "reasoning", "tools"),
-        latency_class="medium",
-        billing="subscription_unlimited",
-        notes="OpenAI GPT-OSS 120B via Antigravity",
+        provider="github-copilot",
+        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        latency_class="slow",
+        billing="subscription_quota",
+        notes="Claude Opus 5.5 via GitHub Copilot ($4.00 / $20.00)",
+    ),
+    "claude_opus_5": ModelProfile(
+        model_id="claude-opus-5",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        latency_class="slow",
+        billing="subscription_quota",
+        notes="Claude Opus 5 via GitHub Copilot ($5.00 / $25.00)",
+    ),
+    "gpt_6_astra": ModelProfile(
+        model_id="gpt-6-astra",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        latency_class="slow",
+        billing="subscription_quota",
+        notes="GPT-6 Astra via GitHub Copilot ($10.00 / $50.00) - flagship",
+    ),
+    "claude_fable_5_1": ModelProfile(
+        model_id="claude-fable-5.1",
+        role="executor",
+        provider="github-copilot",
+        capabilities=("general", "reasoning", "research", "tools"),
+        latency_class="slow",
+        billing="subscription_quota",
+        notes="Claude Fable 5.1 via GitHub Copilot ($10.00 / $50.00, 1M context) - long-context research",
     ),
 }
 
@@ -268,22 +345,24 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         preferred_model_profiles=("local_general",),
         supports_tools=("shell", "read_only"),
         supports_web=False,
-        notes="Deep reasoning, architecture decisions, multi-step planning",
+        notes="Deep reasoning, architecture decisions, multi-step planning. "
+              "(Ornith 1.5 35B would be the ideal fit but is not usable via "
+              "this router's bundled mlx_lm backend - see MODEL_PROFILES note.)",
     ),
     "cloud_standard": TierDefinition(
         name="cloud_standard",
         is_local=False,
         minimum_capability="general",
-        preferred_model_profiles=("gpt_5_6_luna", "gemini_3_8_flash", "gpt_5_6_luna_paid", "qwen_3_8_max", "qwen_3_7_max"),
+        preferred_model_profiles=("gpt_6_luna", "gpt_5_6_luna", "gemini_3_8_flash", "gpt_5_mini", "claude_haiku_4_5"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
-        notes="General tasks that benefit from a stronger model",
+        notes="General tasks that benefit from a stronger model (cheap Copilot models)",
     ),
     "cloud_coding": TierDefinition(
         name="cloud_coding",
         is_local=False,
         minimum_capability="coding",
-        preferred_model_profiles=("gpt_5_6_sol", "gemini_3_1_pro", "claude_sonnet_4_6", "qwen_3_8_max", "qwen_3_7_max", "claude_sonnet_5"),
+        preferred_model_profiles=("gpt_5_3_codex", "kimi_k2_7_code", "mai_code_1_1_flash", "claude_sonnet_5", "gpt_5_6_sol", "gpt_6_astra"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
         notes="Complex refactors, unfamiliar frameworks, high-stakes code",
@@ -292,7 +371,7 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         name="cloud_reasoning",
         is_local=False,
         minimum_capability="general",
-        preferred_model_profiles=("gpt_5_6_sol", "claude_sonnet_4_6", "gemini_3_1_pro", "qwen_3_8_max", "qwen_3_7_max", "claude_sonnet_5"),
+        preferred_model_profiles=("claude_opus_5_5", "gpt_5_6_terra", "gpt_6_astra", "claude_opus_5", "claude_sonnet_5", "gpt_5_6_sol"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
         notes="Adversarial reasoning, deep architecture, high failure cost",
@@ -301,10 +380,10 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         name="cloud_research",
         is_local=False,
         minimum_capability="research",
-        preferred_model_profiles=("gemini_3_1_pro", "gpt_5_6_sol", "qwen_3_8_max", "qwen_3_7_max"),
+        preferred_model_profiles=("claude_fable_5_1", "gpt_6_astra", "gemini_3_8_flash", "gpt_5_6_sol"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
-        notes="Tasks requiring current web data or external sources",
+        notes="Tasks requiring current web data, long context, or external sources",
     ),
 }
 
