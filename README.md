@@ -259,9 +259,8 @@ ModelProfile(
 Supported billing categories are:
 
 1. `local`
-2. `subscription_unlimited`
-3. `subscription_quota`
-4. `paid`
+2. `subscription_quota`
+3. `paid`
 
 Profile keys are stable routing identifiers. `model_id` and `provider` should match the host agent's model registry.
 

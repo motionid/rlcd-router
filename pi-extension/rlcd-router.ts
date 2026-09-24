@@ -326,9 +326,14 @@ export default function (pi: ExtensionAPI) {
         prompt,
         runtime: { prior_failures: priorFailures },
       };
-      if (modelOverride) {
-        body.model_override = modelOverride;
-        modelOverride = null; // one-shot, consumed here same as /route
+      // One-shot override: capture it for this turn, but only clear the
+      // shared state once a model has actually been activated below. If
+      // the /api/route fetch fails, the router config is unavailable, or
+      // Pi cannot activate the chosen model, the override survives so
+      // the next turn retries it instead of silently dropping it.
+      const overrideForThisTurn = modelOverride;
+      if (overrideForThisTurn) {
+        body.model_override = overrideForThisTurn;
       }
 
       const resp = await fetch(`${ROUTER_URL}/api/route`, {
@@ -351,12 +356,17 @@ export default function (pi: ExtensionAPI) {
 
       const config = await fetchRouterConfig();
       if (!config) {
+        // No model will be activated for this turn; suppress outcome
+        // reporting so telemetry does not pretend routing succeeded.
+        lastRouteId = null;
         ctx.ui.setStatus("rlcd", "⚠️ Router config unavailable");
         return;
       }
 
       const picked = await resolveDecisionToModel(decision, config, ctx);
       if (!picked) {
+        // Same as above: the decision selected nothing Pi can run.
+        lastRouteId = null;
         ctx.ui.setStatus(
           "rlcd",
           `⚠️ No available model for tier ${decision.tier}`,
@@ -371,6 +381,9 @@ export default function (pi: ExtensionAPI) {
       if (!alreadyActive) {
         const success = await pi.setModel(picked.model);
         if (!success) {
+          // Activation failed: the routing decision never took effect,
+          // so do not report an outcome for this route.
+          lastRouteId = null;
           ctx.ui.notify(
             `Router picked ${picked.profileName} (${picked.model.provider}/${picked.model.id}) but Pi could not activate it (missing API key/server?).`,
             "warning",
@@ -380,9 +393,17 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // The routing decision now actually controls this turn: consume
+      // the one-shot override and report the outcome against this route.
+      if (overrideForThisTurn) {
+        modelOverride = null;
+      }
       ctx.ui.setStatus("rlcd", `🧭 ${decision.tier} → ${picked.profileName}`);
     } catch (e: any) {
       // Fail open: never block a turn because the router is unreachable.
+      // Also drop any pending route id -- if we got here mid-turn we
+      // cannot trust that a model was activated for it.
+      lastRouteId = null;
       ctx.ui.setStatus("rlcd", "⚠️ Router unreachable");
     }
   });
