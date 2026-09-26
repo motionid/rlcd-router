@@ -171,7 +171,15 @@ REASON_CODES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class TaskClassification:
-    """Deterministic classification of one turn's task."""
+    """Deterministic classification of one turn's task.
+
+    The deterministic classifier populates only the core fields.  The
+    optional Ollaya adapter (``router/ollaya.py``) additionally records
+    its evidence — capability probabilities, the two ``noul``
+    probabilities, and measured latency — so telemetry can audit model
+    assisted decisions.  The fields stay ``None``/empty on the pure
+    deterministic hot path.
+    """
 
     capability: Capability
     confidence: float
@@ -179,9 +187,15 @@ class TaskClassification:
     reasons: tuple[str, ...]
     ambiguous: bool
     classifier: str = "deterministic"
+    # --- optional evidence from model-assisted classification ---
+    # Frozen/hashable: probabilities are a tuple of (label, p) pairs.
+    probabilities: tuple[tuple[str, float], ...] = ()
+    continuation_probability: float | None = None
+    independent_trivial_probability: float | None = None
+    latency_ms: float | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "capability": self.capability.name.lower(),
             "confidence": self.confidence,
             "relationship": self.relationship.value,
@@ -189,6 +203,17 @@ class TaskClassification:
             "ambiguous": self.ambiguous,
             "classifier": self.classifier,
         }
+        if self.probabilities:
+            d["probabilities"] = dict(self.probabilities)
+        if self.continuation_probability is not None:
+            d["continuation_probability"] = self.continuation_probability
+        if self.independent_trivial_probability is not None:
+            d["independent_trivial_probability"] = (
+                self.independent_trivial_probability
+            )
+        if self.latency_ms is not None:
+            d["latency_ms"] = self.latency_ms
+        return d
 
 
 # ---------------------------------------------------------------------------

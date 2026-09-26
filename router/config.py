@@ -486,6 +486,66 @@ COOLDOWN_CONFIG = CooldownConfig(
 
 
 # ---------------------------------------------------------------------------
+# Ollaya — optional local ambiguity classifier (disabled by default)
+#
+# Live verification (Task 1, Ollaya 0.6.1 on Apple Silicon) showed ~205 ms
+# warm / ~2.17 s cold decide latency.  The adapter is therefore enabled
+# only explicitly, invoked only for ambiguous deterministic
+# classifications, and never selects providers, models, access classes,
+# or spending policy — it only answers task-classification questions.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OllayaConfig:
+    """Settings for the optional Ollaya ambiguity classifier.
+
+    Every value is overridable via environment variables
+    (``ROUTER_OLLAYA_*``) so classification behavior can be tuned without
+    code changes.
+
+    ``enabled`` defaults to False: live evidence (task-1 report) passed the
+    structure and latency gates but semantic accuracy is not yet calibrated
+    against labeled fixtures, so Ollaya must be opt-in.
+
+    ``basic_threshold`` is the probability ``required_capability == basic``
+    must reach before the router accepts a local/basic downgrade.  The
+    measured obvious-basic example scored only 0.4874, so the 0.90 default
+    keeps uncalibrated answers on the subscription-safe path.
+
+    ``continuation_threshold`` is the ``is_task_continuation`` probability
+    required to treat a turn as a continuation (measured ambiguous
+    continuation: 0.8152; obvious standalone: 0.1699).  The third question,
+    ``is_independent_trivial_task``, is diagnostic telemetry only and never
+    gates routing on its own.
+    """
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:11435"
+    model: str = "laya"
+    timeout_ms: int = 500
+    basic_threshold: float = 0.90
+    continuation_threshold: float = 0.75
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+OLLAYA_CONFIG = OllayaConfig(
+    enabled=_env_bool("ROUTER_OLLAYA_ENABLED", False),
+    base_url=os.getenv("ROUTER_OLLAYA_URL", "http://127.0.0.1:11435"),
+    model=os.getenv("ROUTER_OLLAYA_MODEL", "laya"),
+    timeout_ms=int(os.getenv("ROUTER_OLLAYA_TIMEOUT_MS", "500")),
+    basic_threshold=_env_float("ROUTER_OLLAYA_BASIC_THRESHOLD", 0.90),
+    continuation_threshold=_env_float(
+        "ROUTER_OLLAYA_CONTINUATION_THRESHOLD", 0.75
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # Tier definitions – abstract routing tiers that PI maps to models
 # ---------------------------------------------------------------------------
 
