@@ -314,12 +314,20 @@ class TestRouterAPI:
         assert decision["capability"] in {
             "basic", "normal", "strong", "reasoning",
         }
+        # Task 2's additive serialization contract: the new keys are
+        # always present and well-typed. Candidates stay empty until the
+        # Task 5 policy populates them, so no exclusion behavior is
+        # asserted here; classifier exclusion is pinned non-vacuously by
+        # executor_candidates() unit tests and the override-catalog test.
         assert isinstance(decision["candidates"], list)
         assert isinstance(decision["excluded"], list)
-        # Classifier profiles can never become executor candidates.
-        candidate_ids = [c["profile_id"] for c in decision["candidates"]]
-        assert "rlcd_fast" not in candidate_ids
-        assert "rlcd_smart" not in candidate_ids
+        for entry in decision["candidates"]:
+            assert entry["capability"] in {
+                "basic", "normal", "strong", "reasoning",
+            }
+            assert entry["access_class"] in {
+                "local", "subscription", "metered-cheap", "metered-expensive",
+            }
         # Compatibility fields retained until migration completes.
         assert decision["tier"] == "local_coding"
         assert decision["eligible_models"]
