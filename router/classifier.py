@@ -1,16 +1,21 @@
 """
-Two-stage RLCD classifier with confidence handling.
+Experimental two-stage RLCD classifier with confidence handling.
 
-Wraps the existing RLCD engine to produce a ``ClassificationResult``
-that the policy engine can consume.  Implements the fast→smart cascade:
+Evaluation-only research code: this cascade is NOT part of the
+production routing path (``/api/route`` uses the deterministic
+classifier in ``router.deterministic``).  It wraps the RLCD engine to
+produce a ``ClassificationResult`` for explicit offline evaluation
+and benchmarking, implementing the experimental fast→smart cascade:
 
   1.  Run RLCD-fast (Qwen2.5 1.5B, ~70-500 ms).
   2.  If confidence is high and no critical field is uncertain, accept.
   3.  Otherwise, run RLCD-smart (Qwen3-Coder-30B-A3B, ~0.5-1.6 s).
   4.  If smart confidence is still low, set ``abstain=True``.
 
-The classifier does NOT call models directly — it delegates to a
-callable ``run_fn`` so it stays testable without loading MLX models.
+The classifier does NOT call models directly — it delegates to an
+injected ``run_fn`` callable so it stays testable without loading MLX
+models, and it is wired into the server only through the deprecated
+legacy evaluation endpoints (never through ``/api/route``).
 """
 
 from __future__ import annotations
@@ -207,14 +212,15 @@ class RouterClassifier:
         prompt: str,
         signals: RuntimeSignals,
     ) -> ClassificationResult:
-        """Run the full cascade and return a classification.
+        """Run the experimental fast→smart cascade and return a
+        classification.
 
-        Both stages use the full 11-field ROUTER_SCHEMA.  The fast
-        stage (Coder-30B-A3B) handles classification directly.  The
-        smart stage re-classifies only when the fast stage is
-        uncertain or blocked by prior failures.
+        Evaluation entry point only: callers inject the RLCD callables
+        explicitly (offline evaluation, benchmarks); this cascade is
+        never invoked by the production ``/api/route`` path.
 
-        The slim FAST_ROUTER_SCHEMA is reserved for future use with
+        Both stages use the full 11-field ROUTER_SCHEMA.  The slim
+        FAST_ROUTER_SCHEMA is reserved for future experiments with
         smaller models that can't reliably classify 11 fields.
         """
 

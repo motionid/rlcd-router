@@ -8,7 +8,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import replace
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -51,6 +51,13 @@ from router.fallback import recommend_subscription_fallback
 # /execute, /route-and-execute, and /run-parallel endpoints import it
 # lazily inside their handlers so importing this module — or serving a
 # production route — never loads MLX.
+#
+# Task 10: RLCD classification is evaluation-only (see
+# router/classifier.py), and the router-owned execution endpoints
+# (/api/execute, /api/route-and-execute) are deprecated legacy
+# endpoints — functional but explicitly marked deprecated in their
+# responses and OpenAPI docs.  Cloud execution belongs to the host
+# (PI); it always did.
 
 app = FastAPI(title="RLCD Multi-Model Router")
 
@@ -170,8 +177,9 @@ class PredictRequest(BaseModel):
 @app.post("/api/run-parallel")
 @app.post("/api/run-rlcd")
 def api_run_parallel(req: PredictRequest):
-    # Legacy/evaluation endpoint: MLX is imported only when explicitly
-    # called, never on the production route path.
+    # Explicit RLCD evaluation endpoint (not part of production
+    # routing): MLX is imported only when explicitly called, never on
+    # the production route path.
     from core.schema import StructuredSchema
     from core.engine import run_parallel_generation
 
@@ -289,14 +297,18 @@ class FallbackRecommendationRequest(BaseModel):
 def _get_router_classifier() -> RouterClassifier:
     """Lazily build the legacy RLCD classifier (MLX-backed).
 
-    Only the deprecated legacy endpoints (/api/route-and-execute) use
-    this; the production /api/route path never calls it.  MLX is
-    imported here — inside the function — so a production route never
-    loads it.
+    Evaluation-only: this builder serves the deprecated legacy
+    /api/route-and-execute endpoint exclusively; the production
+    /api/route path never calls it (it uses the deterministic
+    classifier).  The RLCD cascade is experimental research code kept
+    for explicit offline evaluation.  MLX is imported here — inside
+    the function — so a production route never loads it.
 
-    Single-stage: Qwen3-Coder-30B-A3B-Instruct-4bit (~900 ms)
-    Uses the full 11-field schema.  The 1.5B model was tested but
-    can't reliably classify 11 fields (mean confidence ~0.73).
+    Single-stage wiring: the ``rlcd_smart`` classifier profile's model
+    (Qwen3-Coder-30B-A3B) classifies the full 11-field schema
+    directly; the run_smart stage is unused.  The 1.5B model was
+    tested but can't reliably classify 11 fields (mean confidence
+    ~0.73).
     """
     global _router_classifier
     if _router_classifier is not None:
@@ -1044,8 +1056,39 @@ def api_router_status():
 
 
 # ===================================================================
-# EXECUTE API – run tasks through local models
+# EXECUTE API – deprecated legacy local execution (Task 10)
 # ===================================================================
+# /api/execute and /api/route-and-execute are deprecated legacy
+# endpoints.  They remain functional so existing consumers keep
+# working during the migration window, but new integrations must use
+# POST /api/route and execute through the host (PI owns execution —
+# cloud tiers were never executed here either).  Removal is not yet
+# scheduled: the in-repo consumers (legacy API tests, README docs)
+# must migrate first.
+
+_LEGACY_DEPRECATION_NOTICE = (
+    "Deprecated endpoint: router-owned local execution. Use POST "
+    "/api/route to select a model and run the task through the host; "
+    "cloud execution belongs to the host (PI), not the router."
+)
+
+# Provisional removal horizon for the deprecated endpoints (RFC 8594
+# Sunset header).  Not a scheduled removal date — adjust or disable
+# via ROUTER_LEGACY_SUNSET; an empty value omits the header.
+_DEFAULT_LEGACY_SUNSET = "Fri, 31 Dec 2027 23:59:59 GMT"
+
+
+def _mark_deprecated(response: Response) -> None:
+    """Attach standards-friendly deprecation signals to a legacy response.
+
+    - ``Deprecation: true`` — RFC 9745, versionless form.
+    - ``Sunset: <HTTP-date>`` — RFC 8594, provisional removal horizon.
+    """
+    response.headers["Deprecation"] = "true"
+    sunset = os.environ.get("ROUTER_LEGACY_SUNSET", _DEFAULT_LEGACY_SUNSET)
+    sunset = sunset.strip()
+    if sunset:
+        response.headers["Sunset"] = sunset
 
 # Default system prompts per tier
 TIER_SYSTEM_PROMPTS: Dict[str, str] = {
@@ -1074,25 +1117,30 @@ class ExecuteRequest(BaseModel):
     system_prompt: Optional[str] = None
 
 
-@app.post("/api/execute")
-def api_execute(req: ExecuteRequest):
-    """Execute a task through a local model.
+@app.post("/api/execute", deprecated=True)
+def api_execute(req: ExecuteRequest, response: Response):
+    """(Deprecated) Execute a task through a local model.
 
-    PI calls this after routing to run the actual task.  The tier
-    determines which local model handles the request:
+    **Deprecated legacy endpoint**: the router no longer owns task
+    execution.  Use `POST /api/route` to select a model and run the
+    task through the host (PI) — cloud execution was always delegated
+    to the host, and local execution is migrating there too.  The
+    endpoint stays functional during the migration window; responses
+    carry `Deprecation` and `Sunset` headers.
+
+    The tier determines which local model handles the request:
 
       - local_fast   → Qwen2.5-1.5B
       - local_coding → Qwen3-Coder-30B-A3B
       - local_general / local_reasoning → Qwen3.8-27B
 
-    Cloud tiers are NOT handled here — PI routes those directly
-    through its own provider layer.
-
     Returns:
       - model_id, model_name, tier
       - text (the generated response)
       - elapsed_ms, total_tokens, tokens_per_second
+      - deprecated, deprecation (deprecation signaling)
     """
+    _mark_deprecated(response)
     try:
         # Legacy execution endpoint: MLX is imported only when the
         # endpoint is explicitly called, never on the production path.
@@ -1133,6 +1181,8 @@ def api_execute(req: ExecuteRequest):
             "total_tokens": result["total_tokens"],
             "tokens_per_second": result["tokens_per_second"],
             "mode": result["mode"],
+            "deprecated": True,
+            "deprecation": _LEGACY_DEPRECATION_NOTICE,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1149,13 +1199,18 @@ class RouteAndExecuteRequest(BaseModel):
     system_prompt: Optional[str] = None
 
 
-@app.post("/api/route-and-execute")
-def api_route_and_execute(req: RouteAndExecuteRequest):
-    """Full pipeline: classify → select tier → execute locally.
+@app.post("/api/route-and-execute", deprecated=True)
+def api_route_and_execute(req: RouteAndExecuteRequest, response: Response):
+    """(Deprecated) Classify the prompt, then execute through the chosen local tier.
 
-    If the selected tier is a cloud tier, returns the routing
-    decision without executing (PI handles cloud tiers itself).
+    **Deprecated legacy endpoint**: use `POST /api/route` and execute
+    through the host (PI).  If the selected tier is a cloud tier, the
+    routing decision is returned without executing — cloud execution
+    belongs to the host.  The endpoint stays functional during the
+    migration window; responses carry `Deprecation` and `Sunset`
+    headers.
     """
+    _mark_deprecated(response)
     try:
         # Legacy combined endpoint: MLX is imported only when the
         # endpoint is explicitly called, never on the production path.
@@ -1201,6 +1256,8 @@ def api_route_and_execute(req: RouteAndExecuteRequest):
                 "signals": route_resp["signals"],
                 "decision": decision_dict,
                 "execution": execution_result,
+                "deprecated": True,
+                "deprecation": _LEGACY_DEPRECATION_NOTICE,
             }
 
         # --- Stage 1: Route ---
@@ -1287,6 +1344,8 @@ def api_route_and_execute(req: RouteAndExecuteRequest):
             "signals": signals.to_dict(),
             "decision": decision.to_dict(),
             "execution": execution_result,
+            "deprecated": True,
+            "deprecation": _LEGACY_DEPRECATION_NOTICE,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

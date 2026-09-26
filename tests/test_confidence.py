@@ -11,9 +11,49 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import contextlib
+
 from router.classifier import RouterClassifier, ClassificationResult, bypass_classification
+from router.router_schema import ROUTER_SCHEMA
 from router.signals import RuntimeSignals
 from router.config import ConfidenceThresholds
+
+
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def _mlx_imports_forbidden():
+    """Make importing the MLX backend (and the core engine) raise.
+
+    Simulates a host without Apple Silicon / mlx installed: any import
+    of ``core`` or ``mlx`` raises ImportError for the duration of the
+    context.  Existing sys.modules entries are poisoned and restored.
+    """
+    blocked = ("core", "core.engine", "core.engine_mlx", "core.schema",
+               "mlx", "mlx_lm")
+    saved = {name: sys.modules.get(name, _MISSING) for name in blocked}
+
+    class _Blocker:
+        def find_spec(self, fullname, path=None, target=None):
+            root = fullname.split(".")[0]
+            if root in ("core", "mlx", "mlx_lm"):
+                raise ImportError(f"import blocked for test: {fullname}")
+            return None
+
+    blocker = _Blocker()
+    sys.meta_path.insert(0, blocker)
+    for name in blocked:
+        sys.modules[name] = None  # poison: re-import raises ImportError
+    try:
+        yield
+    finally:
+        sys.meta_path.remove(blocker)
+        for name, module in saved.items():
+            if module is _MISSING:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _signals(**overrides) -> RuntimeSignals:
@@ -148,6 +188,84 @@ class TestBypass:
     def test_bypass_has_all_fields(self):
         result = bypass_classification()
         assert len(result.fields) == 11
+
+
+# ===================================================================
+# Task 10: explicit, evaluation-only RLCD classification
+#
+# RLCD classification is research/evaluation code.  It must stay
+# usable for offline evaluation with injected callables — even when
+# the MLX backend cannot be imported at all — while never being
+# presented as (or coupled to) the production /api/route path.
+# ===================================================================
+
+class TestExplicitEvaluation:
+    """The RLCD cascade works for explicit offline evaluation with
+    injected callables and no MLX backend available."""
+
+    def test_evaluation_uses_injected_fast_callable_without_mlx(self):
+        calls: list[tuple[str, dict]] = []
+
+        def run_fast(context: str, schema: dict) -> dict:
+            calls.append((context, schema))
+            return _make_rlcd_output(_HIGH_CONF_FIELDS)
+
+        classifier = RouterClassifier(run_fast=run_fast)
+        with _mlx_imports_forbidden():
+            result = classifier.classify("Explain recursion", _signals())
+
+        assert calls == [("Explain recursion", ROUTER_SCHEMA)]
+        assert result.classifier_used == "rlcd_fast"
+        assert result.abstain is False
+
+    def test_evaluation_smart_stage_uses_injected_callable(self):
+        low_conf = {k: (v, p * 0.6) for k, (v, p) in _HIGH_CONF_FIELDS.items()}
+        smart_calls: list[str] = []
+
+        def run_fast(context: str, schema: dict) -> dict:
+            return _make_rlcd_output(low_conf)
+
+        def run_smart(context: str, schema: dict) -> dict:
+            smart_calls.append(context)
+            return _make_rlcd_output(_HIGH_CONF_FIELDS)
+
+        classifier = RouterClassifier(run_fast=run_fast, run_smart=run_smart)
+        with _mlx_imports_forbidden():
+            result = classifier.classify("Explain recursion", _signals())
+
+        assert smart_calls == ["Explain recursion"]
+        assert result.classifier_used == "rlcd_smart"
+
+
+class TestRlcdEvaluationOnlyDocumentation:
+    """The RLCD cascade must be documented as evaluation-only.
+
+    Misleading comments that present the fast→smart cascade or the
+    30B classifier as part of the production routing path are a
+    coupling hazard: they invite wiring RLCD back into /api/route.
+    """
+
+    def test_rlcd_classifier_docstring_marks_cascade_evaluation_only(self):
+        import router.classifier as classifier_module
+        doc = " ".join((classifier_module.__doc__ or "").lower().split())
+        assert "evaluation" in doc, (
+            "router/classifier.py must state the cascade is evaluation-only"
+        )
+        assert "experimental" in doc, (
+            "router/classifier.py must mark the cascade experimental"
+        )
+        assert "not part of the production" in doc, (
+            "router/classifier.py must disclaim production use"
+        )
+
+    def test_rlcd_classifier_builder_docstring_marks_evaluation_only(self):
+        import server.app as app_module
+        doc = (app_module._get_router_classifier.__doc__ or "").lower()
+        assert "evaluation" in doc, (
+            "server/app.py's RLCD classifier builder must state it serves "
+            "the deprecated evaluation path, never /api/route"
+        )
+        assert "/api/route" in doc
 
 
 class TestConfidenceThresholds:

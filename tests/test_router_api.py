@@ -589,6 +589,52 @@ class TestProductionRouterAPI:
             f"subprocess failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
         )
 
+    def test_production_route_succeeds_when_mlx_imports_raise(self):
+        """Task 10: with every MLX import/call site patched to raise,
+        /api/route still succeeds and never builds the RLCD classifier."""
+        app = self.app_module
+        blocked = ("core", "core.engine", "core.engine_mlx", "core.schema",
+                   "mlx", "mlx_lm")
+        saved_modules = {name: sys.modules.get(name, None) for name in blocked}
+
+        class _ImportBlocker:
+            def find_spec(self, fullname, path=None, target=None):
+                root = fullname.split(".")[0]
+                if root in ("core", "mlx", "mlx_lm"):
+                    raise AssertionError(
+                        f"production routing must not import {fullname}"
+                    )
+                return None
+
+        blocker = _ImportBlocker()
+        sys.meta_path.insert(0, blocker)
+        # Poison any already-imported backend modules too.
+        for name in blocked:
+            sys.modules[name] = None
+
+        def _fail():
+            raise AssertionError(
+                "production routing must not build the RLCD classifier"
+            )
+
+        saved_builder = app._get_router_classifier
+        app._get_router_classifier = _fail
+        try:
+            resp = self._route("Fix the login bug in auth.py")
+        finally:
+            sys.meta_path.remove(blocker)
+            app._get_router_classifier = saved_builder
+            for name, module in saved_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["classification"]["classifier"] == "deterministic"
+        assert body["decision"]["candidates"]
+
     def test_route_ambiguous_request_works_with_ollaya_disabled(self):
         resp = self._route("hi")
         assert resp.status_code == 200
