@@ -807,12 +807,13 @@ class TestProductionRouterAPI:
         assert availability["status"] == "available"
         assert availability["cooldown_until"] is None
         assert availability["failure_count"] == 1
-        # Telemetry records the failed attempt.
-        events = [
-            e for e in self.app_module._telemetry_log.events
-            if e.event_id == route_id
-        ]
-        assert events and events[-1].status == "failed"
+        # Telemetry records the failed attempt on the route's single
+        # record.  Task 8: a failed non-final candidate keeps the record
+        # pending (it settles on success or candidate exhaustion).
+        ev = self.app_module._telemetry_log.get_event(route_id)
+        assert ev is not None
+        assert ev.attempts and ev.attempts[-1].status == "failed"
+        assert ev.attempts[-1].failure_category == "task_failure"
         # The profile stays eligible on the next turn.
         resp2 = self._route("Fix the login bug in auth.py")
         ids = [
@@ -976,10 +977,14 @@ class TestProductionRouterAPI:
     def test_outcome_updates_availability_when_telemetry_fails(self):
         app = self.app_module
 
-        def boom(event):
+        def boom_start(*args, **kwargs):
             raise RuntimeError("telemetry backend down")
 
-        app._telemetry_log.record = boom
+        def boom_outcome(*args, **kwargs):
+            raise RuntimeError("telemetry backend down")
+
+        app._telemetry_log.start_event = boom_start
+        app._telemetry_log.report_outcome = boom_outcome
         resp = self._route("Fix the login bug in auth.py")
         assert resp.status_code == 200  # telemetry failure never breaks routing
         body = resp.json()
@@ -1003,6 +1008,77 @@ class TestProductionRouterAPI:
             c["profile_id"] for c in resp2.json()["decision"]["candidates"]
         ]
         assert profile_id not in ids
+
+    # ------------------------------------------------------------------
+    # Task 8: single-record telemetry settlement
+    # ------------------------------------------------------------------
+
+    def test_route_outcome_finalizes_single_record_with_attempts(self):
+        app = self.app_module
+        resp = self._route(
+            "Debug the race condition across the repository"
+        )
+        route_id = resp.json()["route_id"]
+        profile_id = resp.json()["decision"]["candidates"][0]["profile_id"]
+
+        # Pending: in memory, not finalized, not in aggregates.
+        assert app._telemetry_log.get_event(route_id).status == "pending"
+        assert route_id not in [e.event_id for e in app._telemetry_log.events]
+
+        out = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "success",
+            "candidate_profile": profile_id,
+            "latency_ms": 1000.0,
+        })
+        assert out.status_code == 200
+
+        events = [e for e in app._telemetry_log.events
+                  if e.event_id == route_id]
+        assert len(events) == 1  # exactly one finalized record
+        ev = events[0]
+        assert ev.status == "success"
+        assert len(ev.attempts) == 1
+        assert ev.attempts[0].profile_id == profile_id
+
+        # A repeated outcome report for the same route/attempt is an
+        # idempotent no-op: no duplicate record, no double-counted cost.
+        out2 = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "success",
+            "candidate_profile": profile_id,
+            "latency_ms": 1000.0,
+            "cost": 0.01,
+        })
+        assert out2.status_code == 200
+        events = [e for e in app._telemetry_log.events
+                  if e.event_id == route_id]
+        assert len(events) == 1
+        assert len(events[0].attempts) == 1
+        assert events[0].latency_ms == 1000.0
+
+    def test_route_outcome_candidate_exhaustion_finalizes_failed(self):
+        app = self.app_module
+        # local_only keeps the candidate set small and deterministic.
+        resp = self._route(
+            "Summarize this output for me",
+            requirements={"local_only": True},
+        )
+        route_id = resp.json()["route_id"]
+        candidates = resp.json()["decision"]["candidates"]
+        assert candidates
+        last = candidates[-1]["profile_id"]
+
+        out = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "task_failure",
+            "candidate_profile": last,
+        })
+        assert out.status_code == 200
+        ev = app._telemetry_log.get_event(route_id)
+        assert ev.status == "failed"  # exhausted: settled as failed
+        assert len(app._telemetry_log.events) >= 1
 
     def test_route_index_is_bounded_with_oldest_eviction(self):
         app = self.app_module

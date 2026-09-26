@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "description": "Labeled routing replay fixture. Cases 1-22 (spec_case) mirror the 22 user-requested routing tests from the design spec (section 20); extra cases exercise additional deterministic paths. The synthetic registry decouples replay from the live model registry so paid-fallback scenarios replay deterministically. expected.min_capability is the required task capability; expected.access_class is the access class of the top selected candidate; expected.ollaya_expected records whether Ollaya is expected to be consulted (deterministic classification is ambiguous and the adapter is enabled) under the case's scenario.",
+  "registry": [
+    {"name": "local_basic", "model_id": "synthetic/local-basic", "provider": "synthetic", "capability": "basic", "access_class": "local", "priority": 10},
+    {"name": "local_coding", "model_id": "synthetic/local-coding", "provider": "synthetic", "capability": "strong", "access_class": "local", "priority": 20, "supports_tools": true},
+    {"name": "sub_normal_a", "model_id": "synthetic/sub-normal-a", "provider": "synthetic", "capability": "normal", "access_class": "subscription", "priority": 10},
+    {"name": "sub_normal_b", "model_id": "synthetic/sub-normal-b", "provider": "synthetic", "capability": "normal", "access_class": "subscription", "priority": 20},
+    {"name": "sub_strong", "model_id": "synthetic/sub-strong", "provider": "synthetic", "capability": "strong", "access_class": "subscription", "priority": 10, "supports_tools": true},
+    {"name": "sub_reasoning", "model_id": "synthetic/sub-reasoning", "provider": "synthetic", "capability": "reasoning", "access_class": "subscription", "priority": 10, "supports_tools": true, "supports_thinking": true},
+    {"name": "paid_cheap_normal", "model_id": "synthetic/paid-cheap-normal", "provider": "synthetic", "capability": "normal", "access_class": "metered-cheap", "priority": 10},
+    {"name": "paid_cheap_strong", "model_id": "synthetic/paid-cheap-strong", "provider": "synthetic", "capability": "strong", "access_class": "metered-cheap", "priority": 20, "supports_tools": true},
+    {"name": "paid_premium_reasoning", "model_id": "synthetic/paid-premium-reasoning", "provider": "synthetic", "capability": "reasoning", "access_class": "metered-expensive", "priority": 10, "supports_tools": true, "supports_thinking": true}
+  ],
+  "cases": [
+    {
+      "id": "01_simple_rename_routes_local",
+      "spec_case": 1,
+      "prompt": "rename the variable foo to bar",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "02_readme_change_routes_local",
+      "spec_case": 2,
+      "prompt": "fix the readme wording in the introduction section",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "03_normal_coding_routes_subscription",
+      "spec_case": 3,
+      "prompt": "Add a dark mode toggle to the settings page",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "04_multi_file_debugging_routes_strong_subscription",
+      "spec_case": 4,
+      "prompt": "Debug the race condition in the scheduler across the repository",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "strong", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "05_fix_it_after_strong_retains_strong",
+      "spec_case": 5,
+      "prompt": "fix it",
+      "turn_context": {"previous_capability": "strong", "previous_model": "sub_strong", "task_failures": 0},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "strong", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "06_commit_message_after_strong_downgrades_local",
+      "spec_case": 6,
+      "prompt": "write a commit message for the staged changes",
+      "turn_context": {"previous_capability": "strong", "previous_model": "sub_strong"},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "07_unavailable_subscription_falls_back_to_next_subscription",
+      "spec_case": 7,
+      "prompt": "Add a dark mode toggle to the settings page",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": ["sub_normal_a"],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "08_all_subscriptions_unavailable_falls_back_to_cheap_metered",
+      "spec_case": 8,
+      "prompt": "Debug the race condition in the scheduler across the repository",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": ["subscription"],
+      "expected": {"min_capability": "strong", "access_class": "metered-cheap", "ollaya_expected": false}
+    },
+    {
+      "id": "09_subscription_recovery_makes_it_eligible_again",
+      "spec_case": 9,
+      "prompt": "Draft the quarterly status update for the team",
+      "turn_context": {},
+      "scenario": "recovery",
+      "recover_profile": "sub_normal_a",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "10_explicit_model_override_bypasses_routing",
+      "spec_case": 10,
+      "prompt": "Refactor the parser modules",
+      "turn_context": {},
+      "scenario": "override",
+      "model_override": "sub_strong",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "strong", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "11_paid_api_not_selected_while_subscription_available",
+      "spec_case": 11,
+      "prompt": "Add a dark mode toggle to the settings page",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "12_local_failure_advances_to_next_candidate",
+      "spec_case": 12,
+      "prompt": "Summarize this output for me",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": ["local_basic"],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "13_repeated_task_failures_raise_capability",
+      "spec_case": 13,
+      "prompt": "Wire up the notification handlers for the new events",
+      "turn_context": {"task_failures": 4},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "reasoning", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "14_router_failure_falls_back_safely",
+      "spec_case": 14,
+      "prompt": "Add a dark mode toggle to the settings page",
+      "turn_context": {},
+      "scenario": "fallback",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "15_candidate_ordering_follows_configuration",
+      "spec_case": 15,
+      "prompt": "Refactor the parser modules and add unit tests",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "strong", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "16_short_ambiguous_prompt_not_automatically_basic",
+      "spec_case": 16,
+      "prompt": "hi",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": true}
+    },
+    {
+      "id": "17_ollaya_unavailability_does_not_prevent_routing",
+      "spec_case": 17,
+      "prompt": "ok",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": true}
+    },
+    {
+      "id": "18_obvious_trivial_request_does_not_call_ollaya",
+      "spec_case": 18,
+      "prompt": "fix the typo in the log message",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "19_ollaya_classifies_ambiguous_continuation",
+      "spec_case": 19,
+      "prompt": "continue",
+      "turn_context": {"previous_prompt": "We were debugging the scheduler race condition", "previous_model": "sub_strong"},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": true}
+    },
+    {
+      "id": "20_low_ollaya_confidence_falls_back_to_subscription",
+      "spec_case": 20,
+      "prompt": "what next",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": true}
+    },
+    {
+      "id": "21_ollaya_can_be_disabled_completely",
+      "spec_case": 21,
+      "prompt": "go ahead",
+      "turn_context": {"previous_prompt": "We were debugging the scheduler race condition"},
+      "scenario": "ollaya_disabled",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "22_normal_routing_requires_no_network_classifier",
+      "spec_case": 22,
+      "prompt": "Update the footer links on the landing page",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "normal", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "23_local_only_requirement_routes_local",
+      "prompt": "Summarize this output for me",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {"local_only": true},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "basic", "access_class": "local", "ollaya_expected": false}
+    },
+    {
+      "id": "24_reasoning_signal_routes_reasoning",
+      "prompt": "Do a deep analysis of the root cause of the intermittent login failures",
+      "turn_context": {},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "reasoning", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "25_multi_file_context_fact_routes_strong",
+      "prompt": "Update the import statements",
+      "turn_context": {"files_involved": 3},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "strong", "access_class": "subscription", "ollaya_expected": false}
+    },
+    {
+      "id": "26_continuation_with_task_failures_escalates_capability",
+      "prompt": "try again",
+      "turn_context": {"previous_capability": "strong", "task_failures": 2},
+      "scenario": "classification",
+      "requirements": {},
+      "unavailable_profiles": [],
+      "unavailable_access_classes": [],
+      "expected": {"min_capability": "reasoning", "access_class": "subscription", "ollaya_expected": false}
+    }
+  ]
+}

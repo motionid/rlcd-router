@@ -1,6 +1,7 @@
 """FastAPI service for deterministic task classification and model routing."""
 
 import hashlib
+import logging
 import os
 import time
 import uuid
@@ -52,6 +53,16 @@ from router.fallback import recommend_subscription_fallback
 # production route — never loads MLX.
 
 app = FastAPI(title="RLCD Multi-Model Router")
+
+logger = logging.getLogger(__name__)
+
+# Optional per-request cost estimate (USD) for the paid/metered alternative.
+# When configured, routes that selected a subscription/local candidate while
+# a paid candidate was eligible record the avoided spend estimate.  Default
+# 0.0 disables estimation (no cost metadata configured).
+_ESTIMATED_PAID_REQUEST_COST = float(
+    os.getenv("ROUTER_ESTIMATED_PAID_REQUEST_COST", "0.0")
+)
 
 
 def _prompt_hash(prompt: str) -> str:
@@ -407,23 +418,54 @@ def _set_last_route(
     }
 
 
+def _ollaya_attempt(classification: TaskClassification) -> tuple[bool, str]:
+    """Ollaya invocation outcome for telemetry (no prompt data, no errors).
+
+    ``classify_task`` consults Ollaya only for ambiguous deterministic
+    results, and converts every adapter failure into the conservative
+    deterministic fallback.  A returned ambiguous result while the
+    adapter is enabled therefore means the Ollaya attempt was made and
+    failed — recorded as ``error_fallback`` so later failure analysis
+    can see the attempt without seeing any prompt.
+    """
+    if classification.classifier == "ollaya":
+        return True, "classified"
+    if classification.classifier != "deterministic":
+        # Fallback / bypass / override classifications never consulted
+        # Ollaya, even when they carry ambiguous=True.
+        return False, "not_consulted"
+    invoked = OLLAYA_CONFIG.enabled and classification.ambiguous
+    return invoked, ("error_fallback" if invoked else "not_consulted")
+
+
 def _record_route_event(
     req: RouteRequest,
     signals,
     classification: TaskClassification,
     decision: RouteDecision,
 ) -> str:
-    """Start telemetry for a route and return its route_id.
+    """Open the single telemetry record for a route and return its route_id.
 
-    Telemetry is compatibility-minimal for now (Task 8 redesigns the
-    record shape) and must never fail a route: exceptions are swallowed.
+    Task 8: the event stays PENDING in memory (no JSONL write) until the
+    route settles through /api/route/outcome — first success or candidate
+    exhaustion — which finalizes exactly one record with an attempts
+    array.  Telemetry must never fail a route: exceptions are swallowed
+    with debug logging.
     """
     route_id = uuid.uuid4().hex[:16]
     # Outcome context is registered BEFORE the best-effort telemetry
     # write so a telemetry failure can never prevent outcome reporting.
     _register_route_index(route_id, list(decision.eligible_models))
     try:
-        event = _telemetry_log.new_event(
+        top = decision.candidates[0] if decision.candidates else None
+        paid_accesses = (
+            AccessClass.METERED_CHEAP, AccessClass.METERED_EXPENSIVE
+        )
+        paid_candidate_available = any(
+            c.access_class in paid_accesses for c in decision.candidates
+        )
+        ollaya_invoked, ollaya_outcome = _ollaya_attempt(classification)
+        _telemetry_log.start_event(
             event_id=route_id,
             prompt_hash=_prompt_hash(req.prompt),
             prompt_chars=signals.prompt_chars,
@@ -435,14 +477,42 @@ def _record_route_event(
             critical_confidence=classification.confidence,
             abstain=classification.ambiguous,
             selected_tier=decision.tier,
+            selected_profile=top.profile_id if top else "",
+            access_class=(
+                top.access_class.value if top is not None else ""
+            ),
             eligible_models=list(decision.eligible_models),
             reasons=list(decision.reasons),
             requirements=decision.requirements.to_dict(),
+            ollaya_invoked=ollaya_invoked,
+            ollaya_outcome=ollaya_outcome,
+            ollaya_confidence=(
+                classification.confidence
+                if classification.classifier == "ollaya" else 0.0
+            ),
+            ollaya_latency_ms=(
+                classification.latency_ms
+                if classification.classifier == "ollaya" else 0.0
+            ) or 0.0,
+            paid_selection_reasons=(
+                list(decision.reasons)
+                if top is not None and top.access_class in paid_accesses
+                else []
+            ),
+            estimated_spend_avoided=(
+                _ESTIMATED_PAID_REQUEST_COST
+                if (
+                    _ESTIMATED_PAID_REQUEST_COST > 0.0
+                    and top is not None
+                    and top.access_class not in paid_accesses
+                    and paid_candidate_available
+                )
+                else 0.0
+            ),
             classifier_latency_ms=classification.latency_ms or 0.0,
         )
-        _telemetry_log.record(event)
     except Exception:
-        pass  # telemetry must never break routing
+        logger.debug("route telemetry start failed", exc_info=True)
     _set_last_route(route_id, classification, decision)
     return route_id
 
@@ -791,9 +861,13 @@ def api_report_outcome(report: OutcomeReport):
     """Record an attempt outcome and update availability or task outcome.
 
     Route resolution goes through the bounded in-memory route index
-    first (telemetry-independent), with the TelemetryLog as a legacy
-    fallback; telemetry writes stay best-effort/fail-open so a telemetry
-    failure can never prevent cooldown or outcome handling.
+    first (telemetry-independent), with the pending/finalized telemetry
+    event as a legacy fallback.  Telemetry stays best-effort/fail-open:
+    the outcome appends an attempt to the route's single pending record
+    and finalizes it on settlement (first success or candidate
+    exhaustion); repeated reports for the same route/attempt identity
+    are idempotent, and a telemetry failure can never prevent cooldown
+    or outcome handling.
 
     Availability categories (rate limit, quota, auth, capacity,
     provider-unknown) cool the provider down; task-side categories
@@ -804,33 +878,12 @@ def api_report_outcome(report: OutcomeReport):
     availability change, plus the model-switch recommendation.
     """
     entry = _route_index.get(report.event_id)
-    event = None
-    for candidate_event in _telemetry_log.events:
-        if candidate_event.event_id == report.event_id:
-            event = candidate_event
-            break
+    event = _telemetry_log.get_event(report.event_id)
     if entry is None and event is None:
         raise HTTPException(
             status_code=404,
             detail=f"event_id {report.event_id} not found",
         )
-
-    # Best-effort telemetry update: fail-open, never blocks the outcome.
-    if event is not None:
-        try:
-            event.status = report.status
-            event.failure_reason = report.failure_reason
-            event.verification = report.verification
-            event.actual_model = report.actual_model
-            event.latency_ms += report.latency_ms
-            event.cost += report.cost
-            _telemetry_log.record(event)
-        except Exception:
-            pass
-
-    if entry is not None:
-        entry["status"] = report.status
-        entry["failure_reason"] = report.failure_reason
 
     # --- category resolution ---------------------------------
     category: Optional[FailureCategory] = None
@@ -842,12 +895,52 @@ def api_report_outcome(report: OutcomeReport):
         except ValueError:
             category = None  # legacy free-text reason: no cooldown
 
-    # --- availability / task-outcome update --------------------
     profile_name = (
         report.candidate_profile
         or (report.actual_model and _profile_name_for_model(report.actual_model))
         or None
     )
+
+    # --- best-effort telemetry: append attempt, settle once ----
+    try:
+        eligible_models = (
+            entry["eligible_models"] if entry is not None
+            else (event.eligible_models if event is not None else [])
+        )
+        exhausted = (
+            report.status == "failed"
+            and bool(eligible_models)
+            and profile_name == eligible_models[-1]
+        )
+        metered = bool(
+            profile_name and profile_name in MODEL_PROFILES
+            and MODEL_PROFILES[profile_name].access_class in (
+                AccessClass.METERED_CHEAP, AccessClass.METERED_EXPENSIVE
+            )
+        )
+        _telemetry_log.report_outcome(
+            report.event_id,
+            profile_id=profile_name or report.actual_model or "",
+            status=report.status,
+            failure_category=(category.value if category else ""),
+            failure_reason=report.failure_reason,
+            verification=report.verification,
+            actual_model=report.actual_model,
+            latency_ms=report.latency_ms,
+            cost=report.cost,
+            estimated_spend_incurred=(
+                report.cost if metered else 0.0
+            ),
+            exhausted=exhausted,
+        )
+    except Exception:
+        logger.debug("outcome telemetry update failed", exc_info=True)
+
+    if entry is not None:
+        entry["status"] = report.status
+        entry["failure_reason"] = report.failure_reason
+
+    # --- availability / task-outcome update --------------------
     availability = None
     if profile_name:
         store = _get_availability_store()
