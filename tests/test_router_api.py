@@ -281,6 +281,49 @@ class TestRouterAPI:
         assert config.MODEL_PROFILES["rlcd_smart"].role == "classifier"
         assert config.MODEL_PROFILES["local_coding"].billing == "local"
 
+    def test_route_config_serializes_capability_and_access_class(self):
+        resp = self.client.get("/api/route/config")
+        assert resp.status_code == 200
+        models = resp.json()["models"]
+
+        local_coding = models["local_coding"]
+        assert local_coding["capability"] == "strong"
+        assert local_coding["access_class"] == "local"
+        assert local_coding["billing"] == "local"  # legacy compat retained
+
+        opus = models["claude_opus_5"]
+        assert opus["capability"] == "reasoning"
+        assert opus["access_class"] == "subscription"
+        assert opus["billing"] == "subscription_quota"  # legacy compat retained
+
+        for name, model in models.items():
+            assert model["capability"] in {
+                "basic", "normal", "strong", "reasoning",
+            }, name
+            assert model["access_class"] in {
+                "local", "subscription", "metered-cheap", "metered-expensive",
+            }, name
+
+    def test_route_decision_exposes_capability_and_candidate_fields(self):
+        resp = self.client.post("/api/route", json={
+            "prompt": "Fix the login bug in auth.py",
+        })
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+
+        assert decision["capability"] in {
+            "basic", "normal", "strong", "reasoning",
+        }
+        assert isinstance(decision["candidates"], list)
+        assert isinstance(decision["excluded"], list)
+        # Classifier profiles can never become executor candidates.
+        candidate_ids = [c["profile_id"] for c in decision["candidates"]]
+        assert "rlcd_fast" not in candidate_ids
+        assert "rlcd_smart" not in candidate_ids
+        # Compatibility fields retained until migration completes.
+        assert decision["tier"] == "local_coding"
+        assert decision["eligible_models"]
+
     def test_override_catalog_uses_supported_billing_order(self):
         response = self.client.get("/api/models/overrides")
         assert response.status_code == 200

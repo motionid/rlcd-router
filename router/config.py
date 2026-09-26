@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum, IntEnum
+from typing import Any, Mapping
 
 
 # Local models already downloaded and managed by oMLX (see ~/.omlx/settings.json
@@ -21,6 +22,36 @@ OMLX_MODELS_DIR = os.getenv("OMLX_MODELS_DIR", os.path.expanduser("~/.omlx/model
 
 
 # ---------------------------------------------------------------------------
+# Capability and access – two independent scales
+#
+# Capability describes what a task requires / a model can do:
+#     BASIC < NORMAL < STRONG < REASONING (ordinal, comparable)
+# Access class describes how using a model is granted or paid for:
+#     local | subscription | metered-cheap | metered-expensive
+#
+# The two are orthogonal: a strong local model, a basic metered model,
+# and a reasoning-class subscription model are all valid combinations.
+# ---------------------------------------------------------------------------
+
+class Capability(IntEnum):
+    """Ordered capability scale.  Independent of access/cost."""
+
+    BASIC = 0
+    NORMAL = 1
+    STRONG = 2
+    REASONING = 3
+
+
+class AccessClass(str, Enum):
+    """How using a model is granted / paid for.  Independent of capability."""
+
+    LOCAL = "local"
+    SUBSCRIPTION = "subscription"
+    METERED_CHEAP = "metered-cheap"
+    METERED_EXPENSIVE = "metered-expensive"
+
+
+# ---------------------------------------------------------------------------
 # Model profiles – describes what each model *is* and what it can do
 # ---------------------------------------------------------------------------
 
@@ -29,10 +60,31 @@ class ModelProfile:
     model_id: str
     role: str                          # "classifier" | "executor"
     provider: str                      # provider key used by the host agent
-    capabilities: tuple[str, ...]      # e.g. ("coding", "tools")
+    capabilities: tuple[str, ...]      # legacy: e.g. ("coding", "tools")
     latency_class: str                 # "fast" | "medium" | "slow"
-    billing: str = "local"             # local | subscription_quota | paid
     notes: str = ""
+    # --- capability/access registry fields ---
+    capability: Capability = Capability.NORMAL
+    access_class: AccessClass = AccessClass.LOCAL
+    priority: int = 10                 # lower wins within an access class
+    enabled: bool = True
+    context_limit: int = 128_000      # max context tokens the model accepts
+    supports_tools: bool = False
+    supports_thinking: bool = False
+
+    @property
+    def billing(self) -> str:
+        """Legacy billing label, derived from access_class (never drifts).
+
+        Kept while compatibility consumers (override catalog grouping,
+        telemetry) still speak the old ``local | subscription_quota | paid``
+        vocabulary.
+        """
+        if self.access_class is AccessClass.LOCAL:
+            return "local"
+        if self.access_class is AccessClass.SUBSCRIPTION:
+            return "subscription_quota"
+        return "paid"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,7 +95,38 @@ class ModelProfile:
             "latency_class": self.latency_class,
             "billing": self.billing,
             "notes": self.notes,
+            "capability": self.capability.name.lower(),
+            "access_class": self.access_class.value,
+            "priority": self.priority,
+            "enabled": self.enabled,
+            "context_limit": self.context_limit,
+            "supports_tools": self.supports_tools,
+            "supports_thinking": self.supports_thinking,
         }
+
+
+def executor_candidates(
+    profiles: Mapping[str, ModelProfile] | None = None,
+) -> dict[str, ModelProfile]:
+    """Enabled executor profiles eligible for execution.
+
+    Classifier profiles can never become executor candidates, even when
+    enabled: they label tasks, they must not execute them.
+    """
+    source = MODEL_PROFILES if profiles is None else profiles
+    return {
+        name: profile
+        for name, profile in source.items()
+        if profile.role == "executor" and profile.enabled
+    }
+
+
+def _priority(name: str, default: int) -> int:
+    """Profile priority (lower wins within an access class).
+
+    Overridable per profile via ``ROUTER_PRIORITY_<PROFILE_NAME_UPPER>``.
+    """
+    return int(os.getenv(f"ROUTER_PRIORITY_{name.upper()}", str(default)))
 
 
 MODEL_PROFILES: dict[str, ModelProfile] = {
@@ -57,7 +140,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="local_mlx",
         capabilities=("classification", "routing"),
         latency_class="fast",
-        billing="local",
+        capability=Capability.BASIC,
+        access_class=AccessClass.LOCAL,
+        priority=_priority("rlcd_fast", 10),
+        context_limit=32_768,
         notes="~70-500 ms, good for obvious tasks",
     ),
     "rlcd_smart": ModelProfile(
@@ -69,7 +155,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="omlx",
         capabilities=("classification", "routing", "coding", "reasoning"),
         latency_class="medium",
-        billing="local",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.LOCAL,
+        priority=_priority("rlcd_smart", 20),
+        context_limit=65_536,
         notes="~0.5-1.6 s MoE, good for ambiguous or code-heavy tasks. Shares weights with local_coding.",
     ),
     # ---- executors (models PI actually runs) ----
@@ -82,7 +171,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="omlx",
         capabilities=("general", "reasoning"),
         latency_class="slow",
-        billing="local",
+        capability=Capability.STRONG,
+        access_class=AccessClass.LOCAL,
+        priority=_priority("local_general", 12),
+        context_limit=65_536,
         notes="Qwen3.8 27B 4bit (General Reasoning) - matches installed oMLX model",
     ),
     "local_coding": ModelProfile(
@@ -94,7 +186,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="omlx",
         capabilities=("coding", "tools", "shell"),
         latency_class="medium",
-        billing="local",
+        capability=Capability.STRONG,
+        access_class=AccessClass.LOCAL,
+        priority=_priority("local_coding", 10),
+        context_limit=65_536,
+        supports_tools=True,
         notes="Qwen3 Coder 30B MoE (Fast Local Coding)",
     ),
     "splash_local": ModelProfile(
@@ -103,7 +199,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider=os.getenv("SPLASH_PROVIDER", "openai"),
         capabilities=("general", "coding", "reasoning", "tools"),
         latency_class="medium",
-        billing="local",
+        capability=Capability.STRONG,
+        access_class=AccessClass.LOCAL,
+        priority=_priority("splash_local", 14),
+        context_limit=65_536,
+        supports_tools=True,
         notes="Splash local server at http://127.0.0.1:8080 (OpenAI-compatible)",
     ),
     # NOTE: Ornith-1.5-35B-A3B-oQ4e-mtp (LookUpMark/Ornith-1.5-35B-A3B-oQ4e-mtp)
@@ -124,7 +224,8 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     # NO unlimited tier on this seat. Every model draws against the same
     # metered enterprise quota, just at very different per-model multipliers
     # (reflected here by the $/M-token notes). All profiles are therefore
-    # billing="subscription_quota"; ordering within each tier still puts the
+    # billing="subscription_quota" (registry: access_class=subscription);
+    # ordering within each tier still puts the
     # cheapest/lowest-multiplier models first to conserve quota.
 
     # -- cheap / fast (routine work, treated as effectively unlimited) --
@@ -134,7 +235,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_6_luna", 10),
+        supports_tools=True,
         notes="GPT-6 Luna via GitHub Copilot ($0.10 / $0.50) - cheapest general/coding model",
     ),
     "gpt_5_6_luna": ModelProfile(
@@ -143,7 +247,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_5_6_luna", 12),
+        supports_tools=True,
         notes="GPT-5.6 Luna via GitHub Copilot ($0.20 / $1.20)",
     ),
     "gemini_3_8_flash": ModelProfile(
@@ -152,7 +259,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "tools", "research"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gemini_3_8_flash", 14),
+        context_limit=1_000_000,
+        supports_tools=True,
         notes="Gemini 3.8 Flash via GitHub Copilot ($0.75 / $3.75, 1M context)",
     ),
     "gpt_5_mini": ModelProfile(
@@ -161,7 +272,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_5_mini", 16),
+        supports_tools=True,
         notes="GPT-5 Mini via GitHub Copilot ($0.25 / $2.00)",
     ),
     "claude_haiku_4_5": ModelProfile(
@@ -170,7 +284,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("claude_haiku_4_5", 18),
+        supports_tools=True,
         notes="Claude Haiku 4.5 via GitHub Copilot ($1.00 / $5.00)",
     ),
     "mai_code_1_1_flash": ModelProfile(
@@ -179,7 +296,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("coding", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.NORMAL,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("mai_code_1_1_flash", 20),
+        supports_tools=True,
         notes="MAI-Code-1.1-Flash via GitHub Copilot ($0.20 / $1.20)",
     ),
 
@@ -190,7 +310,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("coding", "tools", "reasoning"),
         latency_class="medium",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_5_3_codex", 10),
+        supports_tools=True,
         notes="GPT-5.3 Codex via GitHub Copilot ($1.75 / $14.00) - purpose-built coding model",
     ),
     "kimi_k2_7_code": ModelProfile(
@@ -199,7 +322,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("coding", "tools"),
         latency_class="medium",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("kimi_k2_7_code", 12),
+        supports_tools=True,
         notes="Kimi K2.7 Code via GitHub Copilot ($0.95 / $4.00)",
     ),
     "mai_code_1_flash": ModelProfile(
@@ -208,7 +334,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("coding", "tools"),
         latency_class="medium",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("mai_code_1_flash", 14),
+        supports_tools=True,
         notes="MAI-Code-1-Flash via GitHub Copilot ($0.75 / $4.50)",
     ),
 
@@ -219,7 +348,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("claude_sonnet_5", 10),
+        supports_tools=True,
         notes="Claude Sonnet 5 via GitHub Copilot ($2.00 / $10.00)",
     ),
     "grok_4_7": ModelProfile(
@@ -228,7 +360,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "tools"),
         latency_class="medium",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("grok_4_7", 12),
+        supports_tools=True,
         notes="Grok 4.7 via GitHub Copilot ($2.00 / $6.00)",
     ),
     "gpt_5_6_sol": ModelProfile(
@@ -237,7 +372,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="fast",
-        billing="subscription_quota",
+        capability=Capability.STRONG,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_5_6_sol", 14),
+        supports_tools=True,
         notes="GPT-5.6 Sol via GitHub Copilot ($4.00 / $20.00)",
     ),
 
@@ -248,7 +386,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
-        billing="subscription_quota",
+        capability=Capability.REASONING,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_5_6_terra", 10),
+        supports_tools=True,
+        supports_thinking=True,
         notes="GPT-5.6 Terra via GitHub Copilot ($2.00 / $12.00) - deep reasoning",
     ),
     "claude_opus_5_5": ModelProfile(
@@ -257,7 +399,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
-        billing="subscription_quota",
+        capability=Capability.REASONING,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("claude_opus_5_5", 12),
+        supports_tools=True,
+        supports_thinking=True,
         notes="Claude Opus 5.5 via GitHub Copilot ($4.00 / $20.00)",
     ),
     "claude_opus_5": ModelProfile(
@@ -266,7 +412,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
-        billing="subscription_quota",
+        capability=Capability.REASONING,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("claude_opus_5", 14),
+        supports_tools=True,
+        supports_thinking=True,
         notes="Claude Opus 5 via GitHub Copilot ($5.00 / $25.00)",
     ),
     "gpt_6_astra": ModelProfile(
@@ -275,7 +425,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
-        billing="subscription_quota",
+        capability=Capability.REASONING,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("gpt_6_astra", 16),
+        supports_tools=True,
+        supports_thinking=True,
         notes="GPT-6 Astra via GitHub Copilot ($10.00 / $50.00) - flagship",
     ),
     "claude_fable_5_1": ModelProfile(
@@ -284,7 +438,12 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         provider="github-copilot",
         capabilities=("general", "reasoning", "research", "tools"),
         latency_class="slow",
-        billing="subscription_quota",
+        capability=Capability.REASONING,
+        access_class=AccessClass.SUBSCRIPTION,
+        priority=_priority("claude_fable_5_1", 18),
+        context_limit=1_000_000,
+        supports_tools=True,
+        supports_thinking=True,
         notes="Claude Fable 5.1 via GitHub Copilot ($10.00 / $50.00, 1M context) - long-context research",
     ),
 }

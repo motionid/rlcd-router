@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from router.config import AccessClass, Capability
+
 
 @dataclass(frozen=True)
 class TierRequirement:
@@ -36,17 +38,65 @@ class TierRequirement:
 
 
 @dataclass(frozen=True)
-class RouteDecision:
-    """The complete routing decision returned to PI."""
+class Candidate:
+    """An ordered, executable model candidate produced by the policy engine.
 
-    tier: str                     # e.g. "local_coding"
-    eligible_models: tuple[str, ...] # ordered list of model profile names
+    Capability and access class travel together on the candidate so
+    consumers can reason about both without re-reading the registry.
+    """
+
+    profile_id: str
+    provider: str
+    model: str
+    capability: Capability
+    access_class: AccessClass
+    priority: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile_id": self.profile_id,
+            "provider": self.provider,
+            "model": self.model,
+            "capability": self.capability.name.lower(),
+            "access_class": self.access_class.value,
+            "priority": self.priority,
+        }
+
+
+@dataclass(frozen=True)
+class CandidateExclusion:
+    """A profile ruled out before candidacy, with a stable reason code."""
+
+    profile_id: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile_id": self.profile_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class RouteDecision:
+    """The complete routing decision returned to PI.
+
+    ``tier`` and ``eligible_models`` are legacy compatibility fields kept
+    until the tier-based migration completes; new consumers should read
+    ``capability`` / ``candidates`` / ``excluded`` instead.
+    """
+
+    tier: str                     # legacy compat: e.g. "local_coding"
+    eligible_models: tuple[str, ...] # legacy compat: ordered profile names
     requirements: TierRequirement
     classifier_used: str          # "rlcd_fast" | "rlcd_smart" | "bypass"
     confidence: float             # overall classifier confidence
     critical_confidence: float    # lowest confidence among critical fields
     reasons: tuple[str, ...]      # human-readable reason codes
     escalation_config: dict[str, Any] = field(default_factory=dict)
+    capability: Capability = Capability.NORMAL  # required task capability
+    candidates: tuple[Candidate, ...] = ()       # ordered, executable models
+    excluded: tuple[CandidateExclusion, ...] = ()  # ruled-out profiles + why
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +108,9 @@ class RouteDecision:
             "critical_confidence": round(self.critical_confidence, 4),
             "reasons": list(self.reasons),
             "escalation_config": self.escalation_config,
+            "capability": self.capability.name.lower(),
+            "candidates": [c.to_dict() for c in self.candidates],
+            "excluded": [e.to_dict() for e in self.excluded],
         }
 
 
