@@ -320,8 +320,8 @@ class TestRouterAPI:
         })
         assert resp.status_code == 200
         data = resp.json()
-        # Prior failures + coding → cloud_coding
-        assert data["decision"]["tier"] == "cloud_coding"
+        # Prior failures on basic coding → cloud_standard
+        assert data["decision"]["tier"] == "cloud_standard"
 
     def test_route_bypass(self):
         resp = self.client.post("/api/route", json={

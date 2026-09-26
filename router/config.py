@@ -97,6 +97,15 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         billing="local",
         notes="Qwen3 Coder 30B MoE (Fast Local Coding)",
     ),
+    "splash_local": ModelProfile(
+        model_id="incoai/Qwen3.8-27B-Splash",
+        role="executor",
+        provider=os.getenv("SPLASH_PROVIDER", "openai"),
+        capabilities=("general", "coding", "reasoning", "tools"),
+        latency_class="medium",
+        billing="local",
+        notes="Splash local server at http://127.0.0.1:8080 (OpenAI-compatible)",
+    ),
     # NOTE: Ornith-1.5-35B-A3B-oQ4e-mtp (LookUpMark/Ornith-1.5-35B-A3B-oQ4e-mtp)
     # is intentionally NOT registered as a router-executable profile. Its
     # architecture (qwen3_5_moe: hybrid linear-attention MoE + MTP head) is

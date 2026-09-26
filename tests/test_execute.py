@@ -39,6 +39,16 @@ class TestTierToModelMapping:
         td = TIER_DEFINITIONS["local_fast"]
         assert td.preferred_model_profiles[0] == "rlcd_fast"
 
+    def test_splash_local_profile_is_available_for_explicit_selection(self):
+        profile = MODEL_PROFILES["splash_local"]
+        assert profile.model_id == "incoai/Qwen3.8-27B-Splash"
+        assert profile.provider == "openai"
+        assert profile.role == "executor"
+        assert profile.billing == "local"
+        assert {"general", "coding", "reasoning", "tools"}.issubset(
+            profile.capabilities
+        )
+
     def test_all_tiers_have_system_prompts(self):
         from server.app import TIER_SYSTEM_PROMPTS
         for tier_name in TIER_DEFINITIONS:
@@ -58,7 +68,7 @@ class TestEscalationIntegration:
         esc = DEFAULT_ESCALATION["local_coding"]
         next_tier = esc["next_tier"]
         assert next_tier in TIER_DEFINITIONS
-        assert next_tier == "local_reasoning"
+        assert next_tier == "cloud_standard"
 
     def test_full_escalation_chain_all_valid(self):
         from router.decision import DEFAULT_ESCALATION

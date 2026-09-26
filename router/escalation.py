@@ -115,8 +115,9 @@ def escalate(
     """Return the next tier to try, or ``None`` if the chain is exhausted.
 
     The escalation chain is:
-        local_fast → local_general → local_coding → local_reasoning
-        → cloud_coding → cloud_reasoning → cloud_research
+        local_fast → local_general → cloud_standard
+        local_coding → cloud_coding
+        local_reasoning → cloud_reasoning → cloud_research
 
     If ``force_local`` is True (e.g. privacy constraint), the chain
     stops at ``local_reasoning``.

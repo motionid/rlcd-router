@@ -14,6 +14,14 @@ SOURCE = Path("pi-extension/rlcd-router.ts").read_text()
 def test_extension_enforces_and_reports_routes():
     for marker in (
         'pi.on("before_agent_start"',
+        'pi.on("tool_call"',
+        'pi.on("tool_result"',
+        "event.isError",
+        "switchAutomaticLocalFailureToCloud",
+        "requiresTools",
+        "toolCalls",
+        "deliverAs: \"followUp\"",
+
         'pi.setModel(',
         'pi.on("after_provider_response"',
         'pi.on("agent_before_settle"',
@@ -40,17 +48,16 @@ def test_extension_consumes_server_billing_order():
     assert "subscription_unlimited" not in SOURCE
 
 
-def test_extension_preserves_one_shot_override_until_activation():
-    # Final review finding: a one-shot modelOverride must survive a failed
-    # /api/route fetch, unavailable router config, or model activation
-    # failure. The shared override may only be cleared after a model was
-    # actually activated for the turn, not eagerly when building the
-    # request body.
-    assert "const overrideForThisTurn = modelOverride;" in SOURCE
-    # Consumption is gated on the turn-local capture after activation.
-    assert "if (overrideForThisTurn) {" in SOURCE
-    # The eager, unconditional consumption pattern is gone.
-    assert "modelOverride = null; // one-shot, consumed here" not in SOURCE
+def test_extension_preserves_override_until_user_clears_it():
+    # An explicit model choice remains active across turns. It is only
+    # cleared by the /model-override clear/reset/auto command.
+    assert "modelOverride = profileName;" in SOURCE
+    assert 'args === "clear"' in SOURCE
+    assert 'args === "reset"' in SOURCE
+    assert 'args === "auto"' in SOURCE
+    assert "Persistent user override" in SOURCE
+    # Automatic turn completion must not consume the persistent override.
+    assert "modelOverride = null;" in SOURCE  # clear command only
 
 
 def test_extension_clears_route_id_when_no_model_activated():
@@ -71,3 +78,12 @@ def test_extension_clears_route_id_when_no_model_activated():
     # The unreachable-router catch path must also drop a pending route id.
     catch_idx = SOURCE.index("Router unreachable")
     assert "lastRouteId = null" in SOURCE[max(0, catch_idx - 400) : catch_idx]
+
+
+def test_extension_resolves_router_dir_through_symlink():
+    # The extension is installed as a symlink in ~/.pi/agent/extensions/.
+    # Pi reports import.meta.url as the symlink path, so ROUTER_DIR must be
+    # derived from the real path or it resolves to ~/.pi/agent and the
+    # .venv/bin/python spawn fails with ENOENT.
+    assert "realpathSync" in SOURCE
+    assert "realpathSync(fileURLToPath(import.meta.url))" in SOURCE

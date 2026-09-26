@@ -71,15 +71,15 @@ class TestShouldEscalate:
 
 
 class TestEscalateChain:
-    def test_local_coding_escalates_to_local_reasoning(self):
+    def test_local_coding_escalates_to_cloud_standard(self):
         state = ExecutionState()
         next_tier = escalate("local_coding", state)
-        assert next_tier == "local_reasoning"
+        assert next_tier == "cloud_standard"
 
-    def test_local_reasoning_escalates_to_cloud_coding(self):
+    def test_local_reasoning_escalates_to_cloud_reasoning(self):
         state = ExecutionState()
         next_tier = escalate("local_reasoning", state)
-        assert next_tier == "cloud_coding"
+        assert next_tier == "cloud_reasoning"
 
     def test_force_local_stops_at_local_reasoning(self):
         state = ExecutionState()
@@ -109,8 +109,6 @@ class TestEscalateChain:
         assert chain == [
             "local_fast",
             "local_general",
-            "local_coding",
-            "local_reasoning",
         ]
 
     def test_full_chain_with_cloud(self):
@@ -123,7 +121,7 @@ class TestEscalateChain:
             chain.append(tier)
             tier = escalate(tier, state)
 
-        assert "cloud_coding" in chain
+        assert "cloud_standard" in chain
         assert "cloud_reasoning" in chain
         assert chain[-1] == "cloud_research"
 

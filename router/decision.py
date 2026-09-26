@@ -72,17 +72,17 @@ DEFAULT_ESCALATION: dict[str, dict[str, Any]] = {
         "allow_cloud_fallback": False,
     },
     "local_general": {
-        "next_tier": "local_coding",
+        "next_tier": "cloud_standard",
         "max_attempts": 3,
         "allow_cloud_fallback": True,
     },
     "local_coding": {
-        "next_tier": "local_reasoning",
+        "next_tier": "cloud_standard",
         "max_attempts": 3,
         "allow_cloud_fallback": True,
     },
     "local_reasoning": {
-        "next_tier": "cloud_coding",
+        "next_tier": "cloud_reasoning",
         "max_attempts": 2,
         "allow_cloud_fallback": True,
     },

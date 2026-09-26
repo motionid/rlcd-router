@@ -36,27 +36,32 @@ Tier + ordered eligible model profiles
 Host agent executes and reports outcome
 ```
 
-The default escalation chain is:
+The default routing and escalation behavior is cloud-first for substantive work:
 
 ```text
-local_fast
-  → local_general
-  → local_coding
-  → local_reasoning
-  → cloud_coding
-  → cloud_reasoning
-  → cloud_research
+basic coding                  → local_coding
+trivial interactive work      → local_fast → local_general
+medium/serious coding         → cloud_coding
+reasoning/planning            → cloud_reasoning
+fresh information (required)  → cloud_research
+uncertain classification      → cloud_standard
+
+local_coding failure          → cloud_standard → cloud_coding
+local_general failure         → cloud_standard
+cloud_coding failure          → cloud_reasoning
+cloud_reasoning failure      → cloud_research
 ```
 
-`privacy=local_only` or `privacy=sensitive` blocks cloud routing and cloud fallback.
+`privacy=local_only` or `privacy=sensitive` keeps execution local and blocks
+cloud fallback.
 
 ## Features
 
 - **Parallel constrained classification:** all routing fields are evaluated in one RLCD pass.
 - **Deterministic policy:** model selection is auditable and independently testable.
-- **Local-first routing:** local execution is preferred when capability permits.
+- **Cloud-first routing:** local execution is reserved for basic coding and trivial interactive work.
 - **Billing-aware fallbacks:** subscription models precede paid-per-token models.
-- **User overrides:** callers can request a specific model profile for one task.
+- **Persistent user overrides:** an explicitly selected model remains active until cleared.
 - **Ordered fallbacks:** decisions contain `eligible_models`, not only one model.
 - **Escalation:** failed attempts can move to stronger tiers.
 - **Telemetry:** route decisions, confidence, latency, outcomes, and cost can be recorded.
@@ -187,8 +192,8 @@ It provides:
 - health checking so multiple Pi sessions share one server;
 - the `rlcd_classify` constrained-classification tool;
 - `/route <task>` to inspect a routing decision;
-- `/model-override` to select a one-shot override for the next `/route` inspection;
-- `/model-override clear` to return to automatic selection;
+- `/model-override` to select a persistent model override;
+- `/model-override clear` (also `reset` or `auto`) to return to automatic selection;
 - `/model-exhausted <profile>` to handle a subscription quota exhaustion, present the next-best model, and choose a different override if desired.
 
 ### Install using a symlink
@@ -235,7 +240,7 @@ Providers can report a quota exhaustion through `POST /api/route/outcome` using
 with the recommended next model, alternatives, and `can_override: true`.
 
 The Pi extension also provides `/model-exhausted <profile>` to show an interactive
-replacement prompt. The selected model is applied as a one-shot override.
+replacement prompt. The selected model remains active until `/model-override clear`.
 
 ## Configuration
 

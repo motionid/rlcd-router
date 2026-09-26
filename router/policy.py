@@ -10,11 +10,11 @@ The policy has three layers executed in order:
   2. **Capability matching** – the task's functional requirements
      narrow the tier set (coding needs a coding tier, web data needs
      a research tier, etc.).
-  3. **Optimisation** – among the remaining candidates, prefer local
-     over cloud, then prefer the minimum capability that satisfies
-     the task.
+  3. **Optimisation** – reserve local execution for basic coding and
+     trivial interactive work; route substantive work to cloud tiers.
 
-The goal:  *the weakest tier that can reliably complete the task*.
+The goal: *use local models only where they are sufficient, and use cloud
+models for serious coding, reasoning, research, and uncertain tasks*.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def choose_route(
     if abstain:
         reasons.append("classifier_abstained")
         return _build(
-            "local_general",
+            "cloud_standard",
             cls,
             signals,
             reasons,
@@ -141,6 +141,7 @@ def choose_route(
         local_only=local_only,
         needs_coding=needs_coding,
         needs_research=needs_research,
+        fresh_info=fresh_info,
         needs_deep=needs_deep,
         complexity=complexity,
         latency_pref=latency_pref,
@@ -170,6 +171,7 @@ def _select_tier(
     local_only: bool,
     needs_coding: bool,
     needs_research: bool,
+    fresh_info: str,
     needs_deep: bool,
     complexity: str,
     latency_pref: str,
@@ -195,33 +197,30 @@ def _select_tier(
             return "local_fast"
         return "local_general"
 
-    # --- not forced local: prefer local unless there is a reason ---
+    # --- non-local execution is cloud-first ---
     if needs_coding:
-        if complexity in ("trivial", "low") and prior_failures == 0:
-            return "local_coding"
-        if complexity == "medium" and failure_cost not in ("high", "very_high"):
-            return "local_coding"
-        if needs_deep or failure_cost in ("high", "very_high"):
-            return "cloud_coding"
-        if prior_failures >= 1:
-            return "cloud_coding"
-        return "local_coding"
+        # Reserve local execution for genuinely basic coding only. A prior
+        # failure uses the fast cloud-standard fallback; elevated failure cost
+        # uses the stronger cloud-coding tier.
+        if complexity in ("trivial", "low") and failure_cost in ("low", "medium"):
+            if prior_failures == 0:
+                return "local_coding"
+            return "cloud_standard"
+        return "cloud_coding"
 
+    # Deep reasoning is never delegated to the limited local executor.
     if needs_deep:
-        if failure_cost == "very_high":
-            return "cloud_reasoning"
-        if complexity == "critical":
-            return "cloud_reasoning"
-        return "local_reasoning"
+        return "cloud_reasoning"
 
-    # --- general task ---
+    # Useful fresh information does not require the research tier, but it does
+    # require a cloud-capable executor.
+    if fresh_info == "useful":
+        return "cloud_standard"
+
+    # Only trivial interactive non-coding work uses the local fast path.
     if complexity in ("trivial", "low") and latency_pref == "interactive":
         return "local_fast"
 
-    if complexity == "medium":
-        return "local_general"
-
-    # high / critical general tasks
     return "cloud_standard"
 
 

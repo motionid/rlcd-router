@@ -101,7 +101,7 @@ class TestCodingRouting:
         assert decision.tier == "cloud_coding"
         assert decision.requirements.requires_verification is True
 
-    def test_prior_failure_escalates_to_cloud(self):
+    def test_prior_failure_escalates_basic_coding_to_cloud_standard(self):
         cls = _default_classification(
             task_type="code_edit",
             complexity="low",
@@ -113,9 +113,9 @@ class TestCodingRouting:
             _signals(prior_failures=1),
             overall_confidence=0.95,
         )
-        assert decision.tier == "cloud_coding"
+        assert decision.tier == "cloud_standard"
 
-    def test_medium_coding_stays_local(self):
+    def test_medium_coding_goes_to_cloud(self):
         cls = _default_classification(
             task_type="debugging",
             complexity="medium",
@@ -123,7 +123,18 @@ class TestCodingRouting:
             failure_cost="medium",
         )
         decision = choose_route(cls, _signals(), overall_confidence=0.95)
-        assert decision.tier == "local_coding"
+        assert decision.tier == "cloud_coding"
+
+    def test_low_complexity_high_failure_cost_goes_to_cloud(self):
+        cls = _default_classification(
+            task_type="code_edit",
+            complexity="low",
+            coding="dominant",
+            repo_access="modify",
+            failure_cost="high",
+        )
+        decision = choose_route(cls, _signals(), overall_confidence=0.95)
+        assert decision.tier == "cloud_coding"
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +151,14 @@ class TestResearchRouting:
         assert decision.tier == "cloud_research"
         assert decision.requirements.requires_web is True
 
-    def test_fresh_information_useful_stays_local(self):
+    def test_fresh_information_useful_uses_cloud_standard(self):
         cls = _default_classification(
             task_type="research",
             fresh_information="useful",
             complexity="medium",
         )
         decision = choose_route(cls, _signals(), overall_confidence=0.95)
-        assert decision.tier != "cloud_research"
+        assert decision.tier == "cloud_standard"
 
 
 # ---------------------------------------------------------------------------
@@ -155,14 +166,14 @@ class TestResearchRouting:
 # ---------------------------------------------------------------------------
 
 class TestDeepReasoning:
-    def test_deep_reasoning_goes_local_reasoning(self):
+    def test_deep_reasoning_goes_to_cloud_reasoning(self):
         cls = _default_classification(
             task_type="planning",
             reasoning_depth="deep",
             complexity="high",
         )
         decision = choose_route(cls, _signals(), overall_confidence=0.95)
-        assert decision.tier == "local_reasoning"
+        assert decision.tier == "cloud_reasoning"
 
     def test_very_high_failure_cost_goes_cloud_reasoning(self):
         cls = _default_classification(
@@ -179,12 +190,12 @@ class TestDeepReasoning:
 # ---------------------------------------------------------------------------
 
 class TestAbstention:
-    def test_abstain_defaults_to_local_general(self):
+    def test_abstain_defaults_to_cloud_standard(self):
         cls = _default_classification()
         decision = choose_route(
             cls, _signals(), abstain=True, overall_confidence=0.0,
         )
-        assert decision.tier == "local_general"
+        assert decision.tier == "cloud_standard"
         assert "classifier_abstained" in decision.reasons
 
 
@@ -226,7 +237,7 @@ class TestLatencyPreference:
         decision = choose_route(cls, _signals(), overall_confidence=0.95)
         assert decision.tier == "local_fast"
 
-    def test_interactive_does_not_override_coding(self):
+    def test_interactive_basic_coding_uses_local(self):
         cls = _default_classification(
             task_type="code_edit",
             complexity="trivial",
