@@ -8,7 +8,7 @@ code works with different OMLX model paths or cloud providers.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import Any, Mapping
 
@@ -121,6 +121,11 @@ def executor_candidates(
     }
 
 
+def _truthy(raw: str | None) -> bool:
+    """Environment boolean: 1/true/yes/on (case-insensitive)."""
+    return bool(raw) and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _priority(name: str, default: int) -> int:
     """Profile priority (lower wins within an access class).
 
@@ -129,7 +134,32 @@ def _priority(name: str, default: int) -> int:
     return int(os.getenv(f"ROUTER_PRIORITY_{name.upper()}", str(default)))
 
 
-MODEL_PROFILES: dict[str, ModelProfile] = {
+def _enabled(name: str, default: bool) -> bool:
+    """Profile enablement (overridable per profile).
+
+    ``ROUTER_ENABLE_<NAME>=1`` turns a profile on and
+    ``ROUTER_DISABLE_<NAME>=1`` turns it off; disable wins over enable;
+    unset variables keep the profile's declared default.  The metered
+    example profiles below declare ``enabled=False`` so they stay off
+    until real credentials and provider/model IDs are configured.
+    """
+    if _truthy(os.getenv(f"ROUTER_DISABLE_{name.upper()}")):
+        return False
+    if _truthy(os.getenv(f"ROUTER_ENABLE_{name.upper()}")):
+        return True
+    return default
+
+
+def _build_model_profiles() -> dict[str, ModelProfile]:
+    """Construct the profile registry (every knob env-overridable).
+
+    Called once at import time to build ``MODEL_PROFILES``; also callable
+    directly (e.g. from tests with ``monkeypatch``-ed environment) so the
+    env-driven construction is verifiable without reloading the module
+    (reloading would recreate the ``AccessClass``/``Capability`` enums and
+    break identity comparisons in already-imported modules).
+    """
+    profiles: dict[str, ModelProfile] = {
     # ---- classifiers (RLCD models) ----
     "rlcd_fast": ModelProfile(
         model_id=os.getenv(
@@ -446,7 +476,61 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         supports_thinking=True,
         notes="Claude Fable 5.1 via GitHub Copilot ($10.00 / $50.00, 1M context) - long-context research",
     ),
-}
+
+    # ---- metered examples (DISABLED by default) ----
+    # These two profiles demonstrate the metered access classes.  They
+    # are NOT enabled: real per-token credentials and provider/model IDs
+    # must be configured first (host provider config + the env vars
+    # below + ROUTER_ENABLE_<NAME>=1).  Uncertain classifications never
+    # select paid access at all (see router/policy.py), and the safe
+    # fallback never resolves to paid access.
+    "openrouter_qwen": ModelProfile(
+        model_id=os.getenv("ROUTER_METERED_CHEAP_MODEL", "qwen/qwen3-coder"),
+        role="executor",
+        provider=os.getenv("ROUTER_METERED_CHEAP_PROVIDER", "openrouter"),
+        capabilities=("general", "coding", "tools"),
+        latency_class="medium",
+        capability=Capability.STRONG,
+        access_class=AccessClass.METERED_CHEAP,
+        priority=_priority("openrouter_qwen", 10),
+        enabled=False,  # example only: enable explicitly via env
+        supports_tools=True,
+        notes="Example metered-cheap OpenRouter/Qwen profile - disabled by "
+              "default; configure credentials and model IDs before enabling",
+    ),
+    "premium_fallback": ModelProfile(
+        model_id=os.getenv(
+            "ROUTER_METERED_EXPENSIVE_MODEL", "anthropic/claude-opus-4.5"
+        ),
+        role="executor",
+        provider=os.getenv(
+            "ROUTER_METERED_EXPENSIVE_PROVIDER", "openrouter"
+        ),
+        capabilities=("general", "coding", "reasoning", "research", "tools"),
+        latency_class="slow",
+        capability=Capability.REASONING,
+        access_class=AccessClass.METERED_EXPENSIVE,
+        priority=_priority("premium_fallback", 10),
+        enabled=False,  # example only: enable explicitly via env
+        supports_tools=True,
+        supports_thinking=True,
+        notes="Example metered-expensive premium fallback profile - disabled "
+              "by default; configure credentials and model IDs before enabling",
+    ),
+    }
+
+    # Per-profile enablement override, applied uniformly after construction:
+    # ROUTER_ENABLE_<NAME>=1 forces a profile on (e.g. a metered example with
+    # configured credentials), ROUTER_DISABLE_<NAME>=1 forces it off (e.g. a
+    # subscription profile whose seat is suspended).  Disable wins; unset
+    # variables keep the declared default above.
+    return {
+        name: replace(profile, enabled=_enabled(name, profile.enabled))
+        for name, profile in profiles.items()
+    }
+
+
+MODEL_PROFILES: dict[str, ModelProfile] = _build_model_profiles()
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +553,17 @@ class CooldownConfig:
     capacity: float = 120.0         # temporary capacity/overload issue
     unknown: float = 300.0         # unknown provider failure — conservative
     retry_after_cap: float = 3600.0  # safety bound for honored Retry-After
+
+    def to_dict(self) -> dict[str, float]:
+        """Plain-dict serialization (no secrets) for the config/status APIs."""
+        return {
+            "rate_limit": self.rate_limit,
+            "quota": self.quota,
+            "auth": self.auth,
+            "capacity": self.capacity,
+            "unknown": self.unknown,
+            "retry_after_cap": self.retry_after_cap,
+        }
 
 
 def _env_float(name: str, default: float) -> float:
@@ -669,7 +764,16 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
 
 @dataclass(frozen=True)
 class ConfidenceThresholds:
-    """Knobs that control the fast→smart→bypass cascade."""
+    """Knobs for the legacy RLCD cascade — **evaluation-only**.
+
+    These thresholds tune the deprecated fast→smart→bypass RLCD
+    classification cascade, which is served by the explicit evaluation
+    endpoints (``/api/run-parallel``) and the deprecated execution
+    endpoints only.  Production routing never reads them: the
+    deterministic classifier is rule-based and the optional Ollaya
+    adapter carries its own thresholds (see :class:`OllayaConfig`).
+    They remain serialized by ``/api/route/config`` so offline RLCD
+    evaluation runs are reproducible."""
 
     fast_accept_overall: float = 0.85
     fast_accept_critical: float = 0.75

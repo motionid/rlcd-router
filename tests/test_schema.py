@@ -263,14 +263,22 @@ class TestCapabilityAccessRegistry:
                 "metered-expensive",
             }, name
 
-    def test_registry_has_no_metered_profile_without_provider_configuration(self):
-        # Metered production profiles require real provider/model configuration
-        # that does not exist yet; tests use synthetic metered profiles instead.
+    def test_registry_metered_profiles_stay_disabled_without_configuration(self):
+        # Metered access requires real provider credentials and model IDs
+        # before it can spend money.  The registry may carry *example*
+        # metered profiles (Task 11: openrouter_qwen / premium_fallback,
+        # provider/model IDs env-overridable), but they must stay disabled
+        # until explicitly enabled; paid-path behavior is tested with
+        # synthetic metered profiles.
+        metered = (
+            AccessClass.METERED_CHEAP,
+            AccessClass.METERED_EXPENSIVE,
+        )
         for name, profile in MODEL_PROFILES.items():
-            assert profile.access_class in (
-                AccessClass.LOCAL,
-                AccessClass.SUBSCRIPTION,
-            ), name
+            if profile.access_class in metered:
+                assert profile.enabled is False, name
+        assert "openrouter_qwen" in MODEL_PROFILES
+        assert "premium_fallback" in MODEL_PROFILES
 
     def test_registry_migration_assigns_capability_and_access(self):
         assert MODEL_PROFILES["rlcd_fast"].role == "classifier"

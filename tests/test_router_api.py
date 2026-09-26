@@ -954,6 +954,158 @@ class TestProductionRouterAPI:
         assert store.snapshot()["gpt_6_luna"].status == "cooldown"
 
     # ------------------------------------------------------------------
+    # Task 11: configuration serialization and env-driven settings
+    # ------------------------------------------------------------------
+
+    def test_route_config_serializes_priority_enabled_and_cooldowns(self):
+        resp = self.client.get("/api/route/config")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        models = body["models"]
+        for name, model in models.items():
+            assert isinstance(model["priority"], int), name
+            assert isinstance(model["enabled"], bool), name
+        # The metered example profiles serialize their registry fields even
+        # while disabled by default.
+        cheap = models["openrouter_qwen"]
+        assert cheap["access_class"] == "metered-cheap"
+        assert cheap["enabled"] is False
+        assert isinstance(cheap["capability"], str)
+        premium = models["premium_fallback"]
+        assert premium["access_class"] == "metered-expensive"
+        assert premium["enabled"] is False
+
+        assert body["cooldowns"] == {
+            "rate_limit": 60.0,
+            "quota": 900.0,
+            "auth": 300.0,
+            "capacity": 120.0,
+            "unknown": 300.0,
+            "retry_after_cap": 3600.0,
+        }
+
+    def test_status_serializes_non_secret_ollaya_and_cooldowns(self):
+        resp = self.client.get("/api/router/status")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Ollaya settings serialize without secrets: only the four
+        # non-secret configuration fields (plus health) may appear.
+        ollaya = body["classifier"]["ollaya"]
+        assert ollaya["enabled"] is False
+        assert ollaya["base_url"] == "http://127.0.0.1:11435"
+        assert ollaya["model"] == "laya"
+        assert ollaya["timeout_ms"] == 500
+        assert set(ollaya) <= {
+            "enabled", "base_url", "model", "timeout_ms", "health",
+        }
+
+        for name, model in body["models"].items():
+            assert isinstance(model["priority"], int), name
+            assert isinstance(model["enabled"], bool), name
+            assert model["access_class"] in {
+                "local", "subscription", "metered-cheap", "metered-expensive",
+            }, name
+
+        assert body["cooldowns"] == {
+            "rate_limit": 60.0,
+            "quota": 900.0,
+            "auth": 300.0,
+            "capacity": 120.0,
+            "unknown": 300.0,
+            "retry_after_cap": 3600.0,
+        }
+
+    def test_config_metered_examples_are_disabled_and_env_overridable(
+        self, monkeypatch,
+    ):
+        """The metered example profiles ship disabled; provider/model IDs
+        come from the environment so no credentials are invented here.
+        Uses the same builder as import time (no module reload: reloading
+        would recreate the access/capability enums)."""
+        import router.config as config
+        monkeypatch.setenv("ROUTER_METERED_CHEAP_MODEL", "custom/cheap-model")
+        monkeypatch.setenv("ROUTER_METERED_CHEAP_PROVIDER", "custom-provider")
+        monkeypatch.setenv(
+            "ROUTER_METERED_EXPENSIVE_MODEL", "custom/premium-model"
+        )
+        monkeypatch.setenv(
+            "ROUTER_METERED_EXPENSIVE_PROVIDER", "custom-provider"
+        )
+        built = config._build_model_profiles()
+        cheap = built["openrouter_qwen"]
+        assert cheap.enabled is False
+        assert cheap.model_id == "custom/cheap-model"
+        assert cheap.provider == "custom-provider"
+        assert cheap.access_class.value == "metered-cheap"
+        premium = built["premium_fallback"]
+        assert premium.enabled is False
+        assert premium.model_id == "custom/premium-model"
+        assert premium.provider == "custom-provider"
+        assert premium.access_class.value == "metered-expensive"
+        # The live registry keeps the defaults (env not set at import).
+        assert config.MODEL_PROFILES["openrouter_qwen"].enabled is False
+
+    def test_config_profile_enablement_and_priority_env_overrides(
+        self, monkeypatch,
+    ):
+        import router.config as config
+        monkeypatch.setenv("ROUTER_DISABLE_GPT_6_LUNA", "1")
+        monkeypatch.setenv("ROUTER_ENABLE_OPENROUTER_QWEN", "1")
+        monkeypatch.setenv("ROUTER_PRIORITY_GPT_5_MINI", "5")
+        built = config._build_model_profiles()
+        # Disable wins, enable turns a default-disabled example on, and
+        # priority stays env-tunable per profile.
+        assert built["gpt_6_luna"].enabled is False
+        assert built["openrouter_qwen"].enabled is True
+        assert built["gpt_5_mini"].priority == 5
+        # Disabled profiles never become executor candidates.
+        assert "gpt_6_luna" not in {
+            name for name, profile in built.items()
+            if profile.role == "executor" and profile.enabled
+        }
+        assert "openrouter_qwen" in {
+            name for name, profile in built.items()
+            if profile.role == "executor" and profile.enabled
+        }
+
+    def test_config_safe_fallback_profile_env_pins_eligible_fallback(self):
+        # gpt_5_6_sol is NOT the automatic winner (priority 14 loses to
+        # the priority-10 subscription profiles), so only the env pin can
+        # select it here.
+        os.environ["ROUTER_SAFE_FALLBACK_PROFILE"] = "gpt_5_6_sol"
+        try:
+            resp = self._route_with_broken_policy("Fix the login bug in auth.py")
+        finally:
+            os.environ.pop("ROUTER_SAFE_FALLBACK_PROFILE", None)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["classification"]["classifier"] == "fallback"
+        candidates = body["decision"]["candidates"]
+        assert [c["profile_id"] for c in candidates] == ["gpt_5_6_sol"]
+        assert "safe_subscription_default" in body["decision"]["reasons"]
+
+    def test_config_safe_fallback_profile_env_ignored_when_ineligible(self):
+        """A pinned safe fallback is never fabricated when it cannot serve
+        the request; automatic resolution takes over instead."""
+        store = self.app_module._get_availability_store()
+        store.record_failure("gpt_5_6_sol", FailureCategory.QUOTA)
+        os.environ["ROUTER_SAFE_FALLBACK_PROFILE"] = "gpt_5_6_sol"
+        try:
+            resp = self._route_with_broken_policy("Fix the login bug in auth.py")
+        finally:
+            os.environ.pop("ROUTER_SAFE_FALLBACK_PROFILE", None)
+        assert resp.status_code == 200
+        candidates = resp.json()["decision"]["candidates"]
+        ids = [c["profile_id"] for c in candidates]
+        assert ids
+        assert "gpt_5_6_sol" not in ids  # ineligible pin: never fabricated
+        assert all(
+            c["access_class"] == "subscription" for c in candidates
+        )
+
+    # ------------------------------------------------------------------
     # Fix round 1: override compatibility under caller requirements
     # ------------------------------------------------------------------
 

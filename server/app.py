@@ -19,6 +19,7 @@ from router.availability import (
     FailureCategory,
 )
 from router.config import (
+    COOLDOWN_CONFIG,
     OLLAYA_CONFIG,
     TIER_DEFINITIONS,
     MODEL_PROFILES,
@@ -62,6 +63,15 @@ from router.fallback import recommend_subscription_fallback
 app = FastAPI(title="RLCD Multi-Model Router")
 
 logger = logging.getLogger(__name__)
+
+# Debug mode: ROUTER_DEBUG=1 turns on DEBUG logging for the router
+# (telemetry failures, fallback paths, swallowed exceptions).  Off by
+# default.  Telemetry itself is enabled by default and writes JSONL to
+# ROUTER_TELEMETRY_PATH (see TelemetryLog below).
+if os.getenv("ROUTER_DEBUG", "").strip().lower() in (
+    "1", "true", "yes", "on",
+):
+    logging.basicConfig(level=logging.DEBUG)
 
 # Optional per-request cost estimate (USD) for the paid/metered alternative.
 # When configured, routes that selected a subscription/local candidate while
@@ -731,6 +741,18 @@ def _fallback_profile(
         AccessClass.LOCAL if requirements.local_only
         else AccessClass.SUBSCRIPTION
     )
+    # Optional pinned safe fallback (ROUTER_SAFE_FALLBACK_PROFILE): used
+    # only when it passes the same hard filter — an unknown, disabled,
+    # cooled-down, or otherwise ineligible pin is never fabricated and
+    # automatic resolution takes over.
+    pinned = os.getenv("ROUTER_SAFE_FALLBACK_PROFILE", "").strip()
+    if pinned and pinned in MODEL_PROFILES:
+        pinned_profile = MODEL_PROFILES[pinned]
+        if _hard_filter(
+            pinned, pinned_profile, capability, requirements,
+            True, store, (preferred,),
+        ) is None:
+            return pinned, pinned_profile
     pool = []
     for name, profile in MODEL_PROFILES.items():
         reason = _hard_filter(
@@ -998,11 +1020,16 @@ def api_recommend_fallback(req: FallbackRecommendationRequest):
 
 @app.get("/api/route/config")
 def api_router_config():
-    """Return the current router configuration: tiers, models, thresholds."""
+    """Return the current router configuration: tiers, models, thresholds.
+
+    Serializes capability/access/priority/enabled per profile, the
+    evaluation-only confidence thresholds, and the non-secret cooldown
+    durations (see CooldownConfig.to_dict)."""
     return {
         "tiers": {k: v.to_dict() for k, v in TIER_DEFINITIONS.items()},
         "models": {k: v.to_dict() for k, v in MODEL_PROFILES.items()},
         "thresholds": CONFIDENCE_THRESHOLDS.to_dict(),
+        "cooldowns": COOLDOWN_CONFIG.to_dict(),
         "schema_fields": list(ROUTER_SCHEMA.keys()),
     }
 
@@ -1019,7 +1046,8 @@ def api_router_status():
 
     Returns model access/capability/availability (plain-dict copies —
     never live AvailabilityRecord objects), the classifier configuration
-    including Ollaya enabled/health state, and the last route.
+    including Ollaya enabled/health state, the configured non-secret
+    cooldown durations, and the last route.
     """
     snapshot = _get_availability_store().snapshot()
     models: Dict[str, Dict[str, Any]] = {}
@@ -1050,6 +1078,7 @@ def api_router_status():
                 "health": "disabled" if not OLLAYA_CONFIG.enabled else "unknown",
             },
         },
+        "cooldowns": COOLDOWN_CONFIG.to_dict(),
         "models": models,
         "last_route": dict(_last_route) if _last_route else None,
     }
