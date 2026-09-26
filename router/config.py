@@ -450,6 +450,42 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
 
 
 # ---------------------------------------------------------------------------
+# Availability cooldowns — failure-category cooldown durations
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CooldownConfig:
+    """Per-failure-category cooldown durations (seconds).
+
+    Every value is overridable via environment variables so cooldown
+    behavior can be tuned without code changes.  Durations are
+    intentionally bounded: no category disables a profile permanently,
+    and expiry always restores eligibility.
+    """
+
+    rate_limit: float = 60.0        # transient rate limit — short cooldown
+    quota: float = 900.0            # usage/quota limit — medium cooldown
+    auth: float = 300.0            # temporary authentication issue
+    capacity: float = 120.0         # temporary capacity/overload issue
+    unknown: float = 300.0         # unknown provider failure — conservative
+    retry_after_cap: float = 3600.0  # safety bound for honored Retry-After
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
+COOLDOWN_CONFIG = CooldownConfig(
+    rate_limit=_env_float("ROUTER_COOLDOWN_RATE_LIMIT", 60.0),
+    quota=_env_float("ROUTER_COOLDOWN_QUOTA", 900.0),
+    auth=_env_float("ROUTER_COOLDOWN_AUTH", 300.0),
+    capacity=_env_float("ROUTER_COOLDOWN_CAPACITY", 120.0),
+    unknown=_env_float("ROUTER_COOLDOWN_UNKNOWN", 300.0),
+    retry_after_cap=_env_float("ROUTER_COOLDOWN_RETRY_AFTER_CAP", 3600.0),
+)
+
+
+# ---------------------------------------------------------------------------
 # Tier definitions – abstract routing tiers that PI maps to models
 # ---------------------------------------------------------------------------
 

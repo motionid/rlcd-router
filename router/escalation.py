@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from router.availability import FailureCategory
 from router.config import TIER_DEFINITIONS
 from router.decision import DEFAULT_ESCALATION
 
@@ -29,6 +30,11 @@ class ExecutionState:
     allow_cloud_fallback: bool = True
     elapsed_ms: float = 0.0
     total_cost: float = 0.0
+    # Consecutive *task-quality* failures only.  Provider availability
+    # failures (rate limits, quota, outages) advance the candidate cursor
+    # but must never inflate this counter — availability failures must not
+    # raise task capability.
+    task_failure_count: int = 0
 
     @property
     def attempts(self) -> int:
@@ -52,6 +58,7 @@ class ExecutionState:
             "exhausted": self.exhausted,
             "elapsed_ms": round(self.elapsed_ms, 2),
             "total_cost": round(self.total_cost, 6),
+            "task_failure_count": self.task_failure_count,
         }
 
 
@@ -153,9 +160,74 @@ def record_attempt(
     latency_ms: float = 0.0,
     cost: float = 0.0,
 ) -> ExecutionState:
-    """Append an attempt and return the mutated state."""
+    """Append an attempt and return the mutated state.
+
+    Task-quality failures increment ``state.task_failure_count`` (the
+    counter that may later raise required capability).  Availability and
+    local-tool failures do not: they advance the candidate/tier chain
+    without ever blaming the task.
+    """
     state.selected_tiers.append(tier)
     state.attempt_results.append(result)
     state.elapsed_ms += latency_ms
     state.total_cost += cost
+
+    category = outcome_category(result)
+    if category is FailureCategory.TASK_FAILURE:
+        state.task_failure_count += 1
+
     return state
+
+
+# ---------------------------------------------------------------------------
+# Failure-category classification of provider outcomes
+# ---------------------------------------------------------------------------
+
+# Legacy/internal reason codes mapped to availability failure categories.
+# Unlisted failed outcomes fall back to PROVIDER_UNKNOWN (conservative
+# availability handling, never a task-capability increase).
+_AVAILABILITY_REASON_CATEGORY: dict[str, FailureCategory] = {
+    "subscription_exhausted": FailureCategory.QUOTA,
+    "rate_limited": FailureCategory.RATE_LIMIT,
+    "auth_failed": FailureCategory.AUTH,
+    "timeout": FailureCategory.CAPACITY,
+}
+
+# Task-quality reasons: the provider served the request; the work failed.
+_TASK_REASON_CATEGORY: dict[str, FailureCategory] = {
+    "tests_failed": FailureCategory.TASK_FAILURE,
+    "patch_not_applied": FailureCategory.TASK_FAILURE,
+    "invalid_output": FailureCategory.TASK_FAILURE,
+    "schema_violation": FailureCategory.TASK_FAILURE,
+    "semantic_error": FailureCategory.TASK_FAILURE,
+    "scope_exceeded": FailureCategory.TASK_FAILURE,
+    "no_progress": FailureCategory.TASK_FAILURE,
+    "model_uncertain": FailureCategory.TASK_FAILURE,
+    "tool_error": FailureCategory.LOCAL_TOOL_FAILURE,
+}
+
+FAILURE_REASON_CATEGORY: dict[str, FailureCategory] = {
+    **_AVAILABILITY_REASON_CATEGORY,
+    **_TASK_REASON_CATEGORY,
+}
+
+
+def outcome_category(result: dict[str, Any]) -> FailureCategory | None:
+    """Classify a provider outcome into a :class:`FailureCategory`.
+
+    Returns ``None`` for successful outcomes.  An explicit
+    ``failure_category`` in the outcome wins (the caller — e.g. Task 7's
+    outcome API — may carry richer provider metadata); otherwise the
+    reason code is mapped, and unknown failed outcomes map to
+    ``PROVIDER_UNKNOWN`` so availability handles them conservatively
+    without blaming the task.
+    """
+    if result.get("status") == "success":
+        return None
+
+    explicit = result.get("failure_category")
+    if isinstance(explicit, FailureCategory):
+        return explicit
+
+    reason = result.get("failure_reason")
+    return FAILURE_REASON_CATEGORY.get(reason, FailureCategory.PROVIDER_UNKNOWN)

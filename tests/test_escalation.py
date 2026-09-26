@@ -9,11 +9,13 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from router.availability import FailureCategory
 from router.escalation import (
     ExecutionState,
     should_escalate,
     escalate,
     record_attempt,
+    outcome_category,
 )
 
 
@@ -124,6 +126,102 @@ class TestEscalateChain:
         assert "cloud_standard" in chain
         assert "cloud_reasoning" in chain
         assert chain[-1] == "cloud_research"
+
+
+class TestOutcomeCategory:
+    """Failure-category classification of provider outcomes."""
+
+    def test_success_has_no_category(self):
+        assert outcome_category({"status": "success"}) is None
+
+    def test_task_quality_reasons_map_to_task_failure(self):
+        for reason in ("tests_failed", "patch_not_applied", "invalid_output"):
+            assert outcome_category(
+                {"status": "failed", "failure_reason": reason}
+            ) is FailureCategory.TASK_FAILURE
+
+    def test_subscription_exhausted_maps_to_quota(self):
+        assert outcome_category(
+            {"status": "failed", "failure_reason": "subscription_exhausted"}
+        ) is FailureCategory.QUOTA
+
+    def test_rate_limited_maps_to_rate_limit(self):
+        assert outcome_category(
+            {"status": "failed", "failure_reason": "rate_limited"}
+        ) is FailureCategory.RATE_LIMIT
+
+    def test_tool_error_maps_to_local_tool_failure(self):
+        assert outcome_category(
+            {"status": "failed", "failure_reason": "tool_error"}
+        ) is FailureCategory.LOCAL_TOOL_FAILURE
+
+    def test_unknown_failure_is_conservative(self):
+        assert outcome_category({"status": "failed"}) is (
+            FailureCategory.PROVIDER_UNKNOWN
+        )
+
+    def test_explicit_category_is_consumed(self):
+        outcome = {
+            "status": "failed",
+            "failure_category": FailureCategory.CAPACITY,
+        }
+        assert outcome_category(outcome) is FailureCategory.CAPACITY
+
+
+class TestFailureCategorySeparation:
+    """Task failures raise the task counter; availability failures do not."""
+
+    def test_task_failure_increments_task_failure_count(self):
+        state = ExecutionState()
+        record_attempt(
+            state,
+            "local_coding",
+            {"status": "failed", "failure_reason": "tests_failed"},
+        )
+        record_attempt(
+            state,
+            "cloud_coding",
+            {"status": "failed", "failure_reason": "patch_not_applied"},
+        )
+        assert state.task_failure_count == 2
+
+    def test_availability_failure_advances_without_task_capability(self):
+        state = ExecutionState()
+        record_attempt(
+            state,
+            "cloud_coding",
+            {"status": "failed", "failure_reason": "subscription_exhausted"},
+        )
+        record_attempt(
+            state,
+            "cloud_reasoning",
+            {"status": "failed", "failure_reason": "rate_limited"},
+        )
+        # The candidate advanced, but the task was never blamed.
+        assert state.task_failure_count == 0
+
+    def test_local_tool_failure_does_not_blame_task_or_provider(self):
+        state = ExecutionState()
+        record_attempt(
+            state,
+            "local_coding",
+            {"status": "failed", "failure_reason": "tool_error"},
+        )
+        assert state.task_failure_count == 0
+
+    def test_success_does_not_touch_task_failure_count(self):
+        state = ExecutionState(task_failure_count=1)
+        record_attempt(state, "cloud_coding", {"status": "success"})
+        assert state.task_failure_count == 1
+
+    def test_task_failure_count_serializes(self):
+        state = ExecutionState()
+        record_attempt(
+            state,
+            "local_coding",
+            {"status": "failed", "failure_reason": "tests_failed"},
+        )
+        assert state.to_dict()["task_failure_count"] == 1
 
 
 class TestRecordAttempt:
