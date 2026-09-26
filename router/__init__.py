@@ -8,7 +8,12 @@ the policy decides *which tier can satisfy those needs*.
 """
 
 from router.router_schema import ROUTER_SCHEMA, FAST_ROUTER_SCHEMA, FAST_SCHEMA_DEFAULTS
-from router.signals import RuntimeSignals
+from router.signals import RuntimeSignals, TurnContext
+from router.deterministic import (
+    TaskRelationship,
+    TaskClassification,
+    classify_deterministically,
+)
 from router.decision import RouteDecision, TierRequirement
 from router.config import (
     ModelProfile,
@@ -26,6 +31,10 @@ from router.telemetry import RoutingEvent, TelemetryLog
 __all__ = [
     "ROUTER_SCHEMA",
     "RuntimeSignals",
+    "TurnContext",
+    "TaskRelationship",
+    "TaskClassification",
+    "classify_deterministically",
     "RouteDecision",
     "TierRequirement",
     "ModelProfile",
