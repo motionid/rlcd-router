@@ -183,16 +183,15 @@ class AvailabilityStore:
 
         record.failure_count += 1
         record.last_failure_at = now
-        record.reason = category
 
         duration = self._cooldown_duration(category, retry_after)
         if duration is None:
-            # Task-side failure: availability is untouched.
-            record.retry_after = None
-            record.cooldown_until = None
-            record.status = "available"
+            # Task-side failure: cooldown/availability state is untouched —
+            # in particular a task failure must never lift (or set) a
+            # provider cooldown on the same profile.
             return record
 
+        record.reason = category
         record.retry_after = retry_after
         record.cooldown_until = now + duration
         record.status = "cooldown"

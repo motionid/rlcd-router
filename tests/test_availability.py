@@ -203,6 +203,19 @@ class TestFailureCategorySeparation:
         assert record.status == "available"
         assert store.is_available("local_coding") is True
 
+    def test_task_failure_does_not_lift_active_provider_cooldown(self):
+        store, clock = make_store()
+        store.record_failure("gpt_6_luna", FailureCategory.RATE_LIMIT)
+        cooldown_until = store.snapshot()["gpt_6_luna"].cooldown_until
+
+        clock.advance(1.0)
+        store.record_failure("gpt_6_luna", FailureCategory.TASK_FAILURE)
+
+        record = store.snapshot()["gpt_6_luna"]
+        assert record.cooldown_until == cooldown_until
+        assert record.status == "cooldown"
+        assert store.is_available("gpt_6_luna") is False
+
     def test_task_failure_then_provider_failure_only_cooldowns_provider(self):
         store, clock = make_store()
         store.record_failure("local_coding", FailureCategory.TASK_FAILURE)
