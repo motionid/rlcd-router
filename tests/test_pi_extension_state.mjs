@@ -17,7 +17,9 @@ import {
   clearOverride,
   classifyProviderFailure,
   createRouterState,
+  flattenOverrideCatalog,
   outageDecision,
+  resolveOverrideProfile,
   restoreFromBranch,
   settleAttempt,
   withAutomaticSelection,
@@ -269,4 +271,92 @@ test("beginRoute bounds the persisted state", () => {
   assert.ok(state.previousPrompt.length <= 4096);
   assert.ok(state.previousRouteReason.length <= 16);
   assert.equal(state.taskDepth, 1);
+});
+
+// --- round 2: known-override mapping and persistence -------------------------
+
+test("override catalog flattens the server's billing-grouped response", () => {
+  const catalog = flattenOverrideCatalog({
+    billing_order: ["local", "subscription_quota", "paid"],
+    models: {
+      subscription_quota: [
+        {
+          profile_name: "gpt_6_luna",
+          model_id: "gpt-6-luna",
+          provider: "github-copilot",
+          capabilities: ["general"],
+          billing: "subscription_quota",
+          notes: "",
+        },
+        { profile_name: "claude_sonnet_5", model_id: "claude-sonnet-5", provider: "github-copilot" },
+      ],
+      local: [{ profile_name: "local_coding", model_id: "/omlx/models/qwen3-coder", provider: "omlx" }],
+      paid: "not-an-array", // malformed billing group: skipped, not fatal
+    },
+  });
+  assert.equal(catalog.length, 3);
+  assert.ok(catalog.some((e) => e.profile_name === "gpt_6_luna" && e.provider === "github-copilot"));
+  assert.ok(catalog.some((e) => e.profile_name === "local_coding"));
+  // Unusable shapes are null, never guessed from.
+  assert.equal(flattenOverrideCatalog({ models: null }), null);
+  assert.equal(flattenOverrideCatalog("junk"), null);
+  assert.equal(flattenOverrideCatalog(null), null);
+});
+
+test("known manual model maps to its router profile by exact provider/model match", () => {
+  const entries = [
+    { profile_name: "local_coding", model_id: "/omlx/models/qwen3-coder", provider: "omlx" },
+    { profile_name: "gpt_6_luna", model_id: "gpt-6-luna", provider: "github-copilot" },
+  ];
+  assert.equal(resolveOverrideProfile("github-copilot/gpt-6-luna", entries), "gpt_6_luna");
+  // No exact match: never guess (fuzzy, prefix, basename, wrong provider).
+  assert.equal(resolveOverrideProfile("github-copilot/gpt-6", entries), null);
+  assert.equal(resolveOverrideProfile("openai/gpt-6-luna", entries), null);
+  assert.equal(resolveOverrideProfile("omlx/qwen3-coder", entries), null);
+  assert.equal(resolveOverrideProfile("omlx//omlx/models/qwen3-coder", entries), "local_coding");
+  // Unknown or malformed inputs preserve the override untouched.
+  assert.equal(resolveOverrideProfile("no-slash", entries), null);
+  assert.equal(resolveOverrideProfile("github-copilot/", entries), null);
+  assert.equal(resolveOverrideProfile("github-copilot/gpt-6-luna", null), null);
+  assert.equal(resolveOverrideProfile("github-copilot/gpt-6-luna", undefined), null);
+});
+
+test("manual override persists through automatic fallback and bounded continuation", () => {
+  const base = withModelSelection(createRouterState(), "github-copilot/gpt-6-luna", "set");
+  // Unavailable override: the server routes from the normal pool; the
+  // persisted manual preference survives so it can be retried after cooldown.
+  const routed = beginRoute(base, {
+    routeId: "r1",
+    candidates: ["claude_sonnet_5", "gpt_5_3_codex"],
+    activeIndex: 0,
+    prompt: "task",
+    capability: "strong",
+    reasons: ["strong_signal", "override_unavailable:gpt_6_luna"],
+  });
+  assert.equal(routed.overrideModel, "github-copilot/gpt-6-luna");
+  // Automatic candidate activation never replaces the override.
+  const afterAuto = withAutomaticSelection(routed, "github-copilot/claude-sonnet-5");
+  assert.equal(afterAuto.overrideModel, "github-copilot/gpt-6-luna");
+  // Provider failure on the fallback advances within the bound, override intact.
+  const settled = settleAttempt(afterAuto, { outcome: "error", providerStatus: 429, providerHeaders: {} });
+  assert.equal(settled.continueTurn, true);
+  assert.equal(settled.nextProfileId, "gpt_5_3_codex");
+  assert.equal(settled.state.overrideModel, "github-copilot/gpt-6-luna");
+  // Only /router-auto clears it.
+  assert.equal(clearOverride(settled.state).overrideModel, null);
+});
+
+test("available-override route failure has no fallback candidates", () => {
+  const routed = beginRoute(withModelSelection(createRouterState(), "a/b", "set"), {
+    routeId: "r2",
+    candidates: ["gpt_6_luna"],
+    activeIndex: 0,
+    prompt: "p",
+    capability: "normal",
+    reasons: ["user_requested_model", "override:gpt_6_luna"],
+  });
+  const settled = settleAttempt(routed, { outcome: "error", providerStatus: 429, providerHeaders: {} });
+  assert.equal(settled.nextProfileId, null);
+  assert.equal(settled.continueTurn, false);
+  assert.equal(settled.state.overrideModel, "a/b");
 });

@@ -130,6 +130,21 @@ def test_continuation_is_bounded(source):
     assert "continue: true" in source
 
 
+def test_known_override_routes_through_server_catalog(source):
+    # A known manual override (exact match in the server's
+    # /api/models/overrides catalog) is routed with model_override so the
+    # server's unavailable-override normal-pool fallback is reachable
+    # from PI.  Mapping/fetch uncertainty retains the override untouched.
+    for marker in (
+        "/api/models/overrides",
+        "model_override",
+        "resolveOverrideProfile",
+        "flattenOverrideCatalog",
+        "lookupOverrideProfile",
+    ):
+        assert marker in source
+
+
 def test_continuation_clears_stale_provider_evidence(source):
     # Fix round 1: a failover continuation must not reuse the failed
     # attempt's provider evidence.  If the continued provider request

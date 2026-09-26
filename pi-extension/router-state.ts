@@ -504,7 +504,7 @@ export interface OutageDecision {
 }
 
 /**
- * Decide what to do when the router cannot produce a usable route
+ * Resolve what to do when the router cannot produce a usable route
  * (network outage, or an empty candidate list with no explicit
  * fallback).  The active model is retained unless an explicitly
  * configured (and available) fallback subscription model was
@@ -519,4 +519,88 @@ export function outageDecision(
     return { model: fallback, retainedActive: false };
   }
   return { model: state.activeModel || null, retainedActive: true };
+}
+
+// ---------------------------------------------------------------------------
+// Manual override -> router profile mapping (server catalog)
+// ---------------------------------------------------------------------------
+
+/** One entry of the server's /api/models/overrides catalog. */
+export interface OverrideCatalogEntry {
+  profile_name: string;
+  provider: string;
+  model_id: string;
+}
+
+/**
+ * Flatten the server's billing-grouped override catalog
+ * (`{ billing_order: [...], models: { <billing>: [entries] } }`) into a
+ * list of valid entries.  Returns null when the response is unusable;
+ * malformed groups or entries are skipped, never guessed from.
+ */
+export function flattenOverrideCatalog(
+  raw: unknown,
+): OverrideCatalogEntry[] | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const models = (raw as Record<string, unknown>).models;
+  if (models === null || typeof models !== "object" || Array.isArray(models)) {
+    return null;
+  }
+  const entries: OverrideCatalogEntry[] = [];
+  for (const group of Object.values(models)) {
+    if (!Array.isArray(group)) continue; // malformed billing group: skip
+    for (const item of group) {
+      if (item === null || typeof item !== "object") continue;
+      const entry = item as Record<string, unknown>;
+      if (
+        typeof entry.profile_name === "string" && entry.profile_name.length > 0 &&
+        typeof entry.provider === "string" && entry.provider.length > 0 &&
+        typeof entry.model_id === "string" && entry.model_id.length > 0
+      ) {
+        entries.push({
+          profile_name: boundString(entry.profile_name, 64),
+          provider: boundString(entry.provider, 64),
+          model_id: boundString(entry.model_id, MODEL_REF_LIMIT),
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+/**
+ * Map a manual override ("provider/model_id") to its router profile name
+ * by an *exact* provider and model_id match against the catalog.
+ *
+ * Never guesses: fuzzy, prefix, basename, or wrong-provider matches all
+ * return null, as do missing catalogs and malformed references — every
+ * null means "retain the override untouched, do not route".  Disabled
+ * profiles never appear in the catalog (the server excludes them), so
+ * they can never map; uncertainty never selects a paid profile because
+ * uncertainty never routes at all.
+ */
+export function resolveOverrideProfile(
+  overrideModel: string,
+  entries: readonly OverrideCatalogEntry[] | null | undefined,
+): string | null {
+  if (typeof overrideModel !== "string" || !Array.isArray(entries)) {
+    return null;
+  }
+  const sep = overrideModel.indexOf("/");
+  if (sep <= 0 || sep === overrideModel.length - 1) return null;
+  const provider = overrideModel.slice(0, sep);
+  const modelId = overrideModel.slice(sep + 1);
+  for (const entry of entries) {
+    if (
+      entry &&
+      typeof entry === "object" &&
+      entry.provider === provider &&
+      entry.model_id === modelId &&
+      typeof entry.profile_name === "string" &&
+      entry.profile_name.length > 0
+    ) {
+      return entry.profile_name;
+    }
+  }
+  return null;
 }

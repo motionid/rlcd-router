@@ -24,6 +24,12 @@
  *     resulting model_select event is not mistaken for a user override;
  *     user set/cycle *does* create a persistent override (respected
  *     even when no router profile maps the model) until /router-auto.
+ *   - A *known* override (exact match in the server's
+ *     /api/models/overrides catalog) is routed with model_override so
+ *     the server can honor it or fall back to the normal pool during
+ *     cooldown; the manual preference is never cleared by that
+ *     fallback.  Mapping or catalog uncertainty retains the override
+ *     untouched and never routes.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -39,7 +45,9 @@ import {
   beginRoute,
   clearOverride,
   createRouterState,
+  flattenOverrideCatalog,
   outageDecision,
+  resolveOverrideProfile,
   restoreFromBranch,
   settleAttempt,
   withAutomaticSelection,
@@ -160,6 +168,24 @@ export default function turnRouter(pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Map a manual override ("provider/model") to its router profile name
+   * via the server's /api/models/overrides catalog.  Any uncertainty
+   * (catalog outage, malformed response, no exact match) returns null,
+   * which means: retain the override untouched and do not route.
+   */
+  async function lookupOverrideProfile(
+    overrideModel: string,
+  ): Promise<string | null> {
+    let catalog: unknown;
+    try {
+      catalog = await postJson("/api/models/overrides", null, STATUS_TIMEOUT_MS);
+    } catch {
+      return null; // catalog outage: keep the override, do not route
+    }
+    return resolveOverrideProfile(overrideModel, flattenOverrideCatalog(catalog));
+  }
+
   // --- session lifecycle ----------------------------------------------------
 
   pi.on("session_start", async (_event, ctx) => {
@@ -254,9 +280,15 @@ export default function turnRouter(pi: ExtensionAPI) {
     const trimmed = prompt.trim();
     if (!trimmed || trimmed.startsWith("/")) return; // commands / empty: no routing
 
+    // A manual override is kept until /router-auto.  A *known* override
+    // (exact match in the server catalog) is routed with model_override so
+    // the server can honor it — or, while it is in cooldown/incompatible,
+    // fall back to the normal pool for this turn.  Unknown overrides and
+    // catalog uncertainty retain the override untouched and never route.
+    let overrideProfile: string | null = null;
     if (state.overrideModel) {
-      // Persistent manual override: retain the active model until /router-auto.
-      return;
+      overrideProfile = await lookupOverrideProfile(state.overrideModel);
+      if (!overrideProfile) return; // retain the active model until /router-auto
     }
 
     let body: any;
@@ -264,6 +296,7 @@ export default function turnRouter(pi: ExtensionAPI) {
       body = await postJson(
         "/api/route",
         {
+          ...(overrideProfile ? { model_override: overrideProfile } : {}),
           prompt,
           turn_context: {
             previous_prompt: state.previousPrompt,
@@ -293,10 +326,27 @@ export default function turnRouter(pi: ExtensionAPI) {
     const candidates: any[] = Array.isArray(routeDecision.candidates)
       ? routeDecision.candidates
       : [];
+
+    // Compact override status (unavailable / incompatible) from the
+    // server; routing continues from the normal pool while the manual
+    // preference stays persisted for retry after cooldown.
+    let overrideNote = "";
+    const overrideInfo = body?.override;
+    if (overrideProfile && overrideInfo && typeof overrideInfo === "object") {
+      if (overrideInfo.available === false) {
+        overrideNote = `override ${overrideProfile} unavailable`;
+      } else if (overrideInfo.compatible === false) {
+        overrideNote = `override ${overrideProfile} incompatible (${overrideInfo.reason ?? "requirements"})`;
+      }
+    }
+
     if (!routeId || candidates.length === 0) {
       // Empty candidate list (the server found nothing eligible, including
       // its own safe-subscription fallback resolution): retain active model.
-      showRoute(ctx, "ROUTE no candidates · retaining active model");
+      showRoute(
+        ctx,
+        `ROUTE ${overrideNote ? `${overrideNote} · ` : ""}no candidates · retaining active model`,
+      );
       return;
     }
 
@@ -314,6 +364,17 @@ export default function turnRouter(pi: ExtensionAPI) {
       const candidate = candidates[i] ?? {};
       const model = routeModels.get(String(candidate.profile_id ?? ""));
       if (!model) continue; // not in PI's registry: an activation failure
+      // Already the active model (a known available override usually is):
+      // keep it without a redundant setModel/model_select round trip.
+      if (
+        ctx.model !== undefined &&
+        model.provider === ctx.model.provider &&
+        model.id === ctx.model.id
+      ) {
+        activeIndex = i;
+        activeProfile = String(candidate.profile_id ?? "");
+        break;
+      }
       if (await activate(ctx, model)) {
         activeIndex = i;
         activeProfile = String(candidate.profile_id ?? "");
@@ -346,10 +407,13 @@ export default function turnRouter(pi: ExtensionAPI) {
     });
     persist();
 
-    // One compact route line: capability · classifier · profile · reason.
+    // One compact route line: capability · classifier · profile · reason
+    // (with the override status appended when the server reported one).
     showRoute(
       ctx,
-      `ROUTE ${capability ?? "-"} · ${classifier} · ${activeProfile} · ${reasons[0] ?? "-"}`,
+      `ROUTE ${capability ?? "-"} · ${classifier} · ${activeProfile} · ${reasons[0] ?? "-"}${
+        overrideNote ? ` · ${overrideNote}` : ""
+      }`,
     );
   });
 
