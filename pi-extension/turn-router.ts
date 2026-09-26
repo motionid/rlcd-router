@@ -418,6 +418,12 @@ export default function turnRouter(pi: ExtensionAPI) {
             }`,
           );
           persist();
+          // Fresh evidence for the continued attempt: clear the failed
+          // attempt's status/Retry-After so a continuation that errors
+          // without any HTTP response cannot settle against stale
+          // provider evidence (which would wrongly cool this candidate).
+          providerStatus = null;
+          providerHeaders = {};
           return { continue: true };
         }
       }

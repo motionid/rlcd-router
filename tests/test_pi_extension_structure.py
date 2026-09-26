@@ -128,3 +128,31 @@ def test_continuation_is_bounded(source):
     # activated and the per-route attempt limit permits it.
     assert "maxAttempts" in source
     assert "continue: true" in source
+
+
+def test_continuation_clears_stale_provider_evidence(source):
+    # Fix round 1: a failover continuation must not reuse the failed
+    # attempt's provider evidence.  If the continued provider request
+    # errors without any HTTP response, the next agent_before_settle
+    # would otherwise settle against the previous attempt's stale
+    # 429/Retry-After and wrongly cool down candidate 2.  The reset must
+    # happen inside the settlement handler, after the next candidate was
+    # successfully activated and before requesting the continuation.
+    settle_start = source.index('pi.on("agent_before_settle"')
+    settle_end = source.index('pi.registerCommand("router-auto"')
+    settle_block = source[settle_start:settle_end]
+
+    activation = settle_block.index("await activate(ctx, model)")
+    reset = settle_block.index("providerStatus = null")
+    continuation = settle_block.index("return { continue: true }")
+    assert activation < reset, (
+        "provider evidence must be cleared only after the next candidate "
+        "was successfully activated"
+    )
+    assert reset < continuation, (
+        "provider evidence must be cleared before requesting the continued "
+        "provider attempt, never after"
+    )
+    # The reset must be inside the activation-success branch, not the
+    # pre-loop settlement path.
+    assert settle_block.index("if (activated) {") < reset
