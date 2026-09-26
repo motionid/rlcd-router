@@ -517,6 +517,13 @@ class OllayaConfig:
     continuation: 0.8152; obvious standalone: 0.1699).  The third question,
     ``is_independent_trivial_task``, is diagnostic telemetry only and never
     gates routing on its own.
+
+    ``capability_threshold`` is the answer ``confidence`` an
+    above-NORMAL capability choice (strong/reasoning) must reach before
+    the router accepts the upclassification.  Measured confidences were
+    low (0.3165 / 0.2047), so 0.60 keeps uncalibrated answers on the
+    conservative NORMAL / inherited-continuation path; only confident
+    answers may raise the capability.
     """
 
     enabled: bool = False
@@ -525,6 +532,7 @@ class OllayaConfig:
     timeout_ms: int = 500
     basic_threshold: float = 0.90
     continuation_threshold: float = 0.75
+    capability_threshold: float = 0.60
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -541,6 +549,9 @@ OLLAYA_CONFIG = OllayaConfig(
     basic_threshold=_env_float("ROUTER_OLLAYA_BASIC_THRESHOLD", 0.90),
     continuation_threshold=_env_float(
         "ROUTER_OLLAYA_CONTINUATION_THRESHOLD", 0.75
+    ),
+    capability_threshold=_env_float(
+        "ROUTER_OLLAYA_CAPABILITY_THRESHOLD", 0.60
     ),
 )
 

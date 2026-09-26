@@ -138,6 +138,9 @@ OLLAYA_REASON_CODES: frozenset[str] = frozenset({
     "ollaya_missing_history",
     "ollaya_basic_confident",
     "ollaya_basic_below_threshold",
+    # An above-NORMAL choice whose confidence missed capability_threshold;
+    # the label is discarded in favor of the conservative path.
+    "ollaya_low_confidence_capability",
     # Diagnostic telemetry only — never gates routing (Task 1 ruling).
     "ollaya_independent_trivial_diagnostic",
 })
@@ -240,6 +243,16 @@ def _require_prob(value: Any, where: str) -> float:
 
 def _parse_response(response: Mapping[str, Any]) -> _ParsedDecision:
     answers = _require_mapping(response.get("answers"), "answers")
+
+    # A truncated state means Ollaya classified from only part of the
+    # turn's context — the decision cannot be trusted.  Fail closed to
+    # the deterministic fallback (raise the parse/error type; Task 6
+    # fix round 1, reviewer finding 2).
+    if response.get("state_truncated") is True:
+        raise OllayaParseError(
+            "Ollaya reported state_truncated=true; the classification was "
+            "made from partial state"
+        )
 
     capability_answer = _require_mapping(
         answers.get("required_capability"),
@@ -382,31 +395,56 @@ class OllayaClassifier:
     ) -> TaskClassification:
         """Map a parsed decision onto router-owned types.
 
-        Conservative mapping rules (binding rulings from Task 1):
+        Conservative mapping rules (binding rulings from Task 1, plus
+        fix round 1):
 
         - ``is_independent_trivial_task`` is telemetry only; it never
           alone permits a local/basic downgrade.
         - A basic downgrade requires the basic *probability* to clear
           ``basic_threshold`` and the turn to not be a continuation.
           Otherwise the turn lands on subscription-safe NORMAL.
+        - An above-NORMAL capability choice (strong/reasoning) is only
+          accepted when its ``confidence`` meets ``capability_threshold``.
+          Low-confidence capability evidence is discarded: a
+          non-continuation lands on NORMAL, a continuation inherits the
+          previous capability exactly — never ``max(low_confidence_choice,
+          previous)``.  High-confidence capability may conservatively
+          raise an inherited capability.
         - A confirmed continuation inherits the previous capability
           (floored at NORMAL when history is missing).
         """
-        capability = parsed.capability
+        choice = parsed.capability
         reasons: list[str] = ["ollaya_classified"]
+
+        # Capability-confidence gate (fix round 1, finding 1): only
+        # confident answers may classify above NORMAL.
+        upclassifies = (
+            choice > Capability.NORMAL
+            and parsed.confidence >= self.config.capability_threshold
+        )
+        if not upclassifies and choice > Capability.NORMAL:
+            reasons.append("ollaya_low_confidence_capability")
+        trusted_capability = (
+            choice if choice <= Capability.NORMAL or upclassifies
+            else Capability.NORMAL
+        )
 
         if parsed.continuation >= self.config.continuation_threshold:
             relationship = TaskRelationship.CONTINUATION
             reasons.append("ollaya_continuation")
             if context.previous_capability is not None:
-                if capability < context.previous_capability:
-                    capability = context.previous_capability
+                # Inherit exactly; only confident capability evidence
+                # may conservatively raise it.
+                capability = context.previous_capability
+                if trusted_capability > capability:
+                    capability = trusted_capability
                 reasons.append("ollaya_inherited_capability")
             else:
-                capability = max(capability, Capability.NORMAL)
+                capability = max(trusted_capability, Capability.NORMAL)
                 reasons.append("ollaya_missing_history")
         else:
-            if capability is Capability.BASIC:
+            capability = trusted_capability
+            if choice is Capability.BASIC:
                 relationship = TaskRelationship.INDEPENDENT
                 basic_prob = dict(parsed.probabilities).get("basic", 0.0)
                 if basic_prob >= self.config.basic_threshold:

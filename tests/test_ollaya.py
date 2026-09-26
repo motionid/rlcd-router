@@ -312,6 +312,155 @@ class TestAmbiguousClassification:
 
 
 # ---------------------------------------------------------------------------
+# Capability-confidence gate — upclassification must be confident
+# ---------------------------------------------------------------------------
+
+def strong_response(confidence: float, continuation: float) -> dict:
+    """A strong-choice answer with explicit confidence/continuation."""
+    response = dict(CONTINUATION_RESPONSE)
+    response["answers"] = dict(
+        CONTINUATION_RESPONSE["answers"],
+        **{
+            "required_capability": {
+                "type": "choice",
+                "choice": "strong",
+                "confidence": confidence,
+                "probabilities": {
+                    "basic": 0.09, "normal": 0.32,
+                    "strong": 0.40, "reasoning": 0.19,
+                },
+            },
+            "is_task_continuation": {"type": "noul", "noul": continuation},
+        },
+    )
+    return response
+
+
+class TestCapabilityConfidenceGate:
+    def test_capability_threshold_defaults_to_060(self):
+        assert OllayaConfig().capability_threshold == 0.60
+
+    def test_low_confidence_strong_non_continuation_stays_normal(self):
+        # Task 1 live evidence: the ambiguous continuation answer carried
+        # only 0.2047 confidence.  A strong label at that confidence must
+        # not upclassify — conservative NORMAL instead.
+        result = classify_task(
+            "What is the capital of France?",
+            TurnContext(),
+            ollaya=enabled_classifier(
+                response=strong_response(confidence=0.2047,
+                                         continuation=0.10)),
+        )
+        assert result.classifier == "ollaya"
+        assert result.capability == Capability.NORMAL
+        assert "ollaya_low_confidence_capability" in result.reasons
+
+    def test_low_confidence_reasoning_non_continuation_stays_normal(self):
+        response = strong_response(confidence=0.30, continuation=0.10)
+        response["answers"]["required_capability"]["choice"] = "reasoning"
+        result = classify_task(
+            "What is the capital of France?",
+            TurnContext(),
+            ollaya=enabled_classifier(response=response),
+        )
+        assert result.capability == Capability.NORMAL
+        assert "ollaya_low_confidence_capability" in result.reasons
+
+    def test_low_confidence_strong_continuation_inherits_not_max(self):
+        # High-confidence continuation, low-confidence capability: the
+        # turn inherits the previous NORMAL capability — it must not be
+        # max()'d upward by the untrusted strong label.
+        context = TurnContext(
+            previous_prompt="add input validation to the forms",
+            previous_capability=Capability.NORMAL,
+            previous_model="gpt_6_luna",
+        )
+        result = classify_task(
+            "yes, go ahead",
+            context,
+            ollaya=enabled_classifier(
+                response=strong_response(confidence=0.2047,
+                                         continuation=0.85)),
+        )
+        assert result.relationship is TaskRelationship.CONTINUATION
+        assert result.capability == Capability.NORMAL
+        assert "ollaya_low_confidence_capability" in result.reasons
+        assert "ollaya_inherited_capability" in result.reasons
+
+    def test_high_confidence_strong_continuation_conservatively_raises(self):
+        context = TurnContext(
+            previous_prompt="add input validation to the forms",
+            previous_capability=Capability.NORMAL,
+            previous_model="gpt_6_luna",
+        )
+        result = classify_task(
+            "yes, go ahead",
+            context,
+            ollaya=enabled_classifier(
+                response=strong_response(confidence=0.90,
+                                         continuation=0.85)),
+        )
+        assert result.relationship is TaskRelationship.CONTINUATION
+        assert result.capability == Capability.STRONG
+        assert "ollaya_low_confidence_capability" not in result.reasons
+
+    def test_high_confidence_strong_non_continuation_is_accepted(self):
+        result = classify_task(
+            "What is the capital of France?",
+            TurnContext(),
+            ollaya=enabled_classifier(
+                response=strong_response(confidence=0.90,
+                                         continuation=0.10)),
+        )
+        assert result.capability == Capability.STRONG
+        assert result.relationship is TaskRelationship.NEW_SUBSTANTIAL
+        assert "ollaya_low_confidence_capability" not in result.reasons
+
+    def test_capability_threshold_is_configurable(self):
+        config = OllayaConfig(enabled=True, capability_threshold=0.10)
+        result = classify_task(
+            "What is the capital of France?",
+            TurnContext(),
+            ollaya=enabled_classifier(
+                response=strong_response(confidence=0.2047,
+                                         continuation=0.10),
+                config=config,
+            ),
+        )
+        # With the threshold lowered, 0.2047 confidence is accepted.
+        assert result.capability == Capability.STRONG
+
+
+class TestStateTruncation:
+    def test_state_truncated_true_returns_deterministic_fallback(self):
+        truncated = dict(BASIC_RESPONSE, state_truncated=True)
+        result = classify_task(
+            "why?",
+            TurnContext(),
+            ollaya=enabled_classifier(response=truncated),
+        )
+        assert result.classifier == "deterministic"
+        assert result.ambiguous is True
+        assert result.capability >= Capability.NORMAL
+
+    def test_state_truncated_true_raises_parse_error(self):
+        truncated = dict(BASIC_RESPONSE, state_truncated=True)
+        classifier = enabled_classifier(response=truncated)
+        with pytest.raises(OllayaParseError):
+            classifier.classify("why?", TurnContext())
+
+    def test_state_truncated_false_is_accepted(self):
+        # The Task 1 wire format always carries the flag; only `true` is a
+        # fallback condition.
+        result = classify_task(
+            "yes, go ahead",
+            continuation_context(),
+            ollaya=enabled_classifier(response=CONTINUATION_RESPONSE),
+        )
+        assert result.classifier == "ollaya"
+
+
+# ---------------------------------------------------------------------------
 # Failure behavior — Ollaya is never a single point of failure
 # ---------------------------------------------------------------------------
 
