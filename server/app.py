@@ -1,28 +1,47 @@
-"""FastAPI service for RLCD task classification and model routing."""
+"""FastAPI service for deterministic task classification and model routing."""
 
 import hashlib
 import os
+import time
+import uuid
+from dataclasses import replace
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.schema import StructuredSchema
-from core.engine import (
-    MODEL_ID,
-    list_loaded_models,
-    run_parallel_generation,
-    run_parallel_for_model,
-    run_text_generation,
+# --- production router interfaces (no MLX, no network required) ---
+from router.availability import (
+    AvailabilityRecord,
+    AvailabilityStore,
+    FailureCategory,
 )
+from router.config import (
+    OLLAYA_CONFIG,
+    TIER_DEFINITIONS,
+    MODEL_PROFILES,
+    CONFIDENCE_THRESHOLDS,
+    AccessClass,
+    Capability,
+)
+from router.decision import Candidate, RouteDecision, TierRequirement
+from router.deterministic import TaskClassification, TaskRelationship
+from router.ollaya import classify_task
+from router.policy import RouteRequirements, build_route
 
+# --- legacy router interfaces (kept during migration) ---
 from router.router_schema import ROUTER_SCHEMA
-from router.signals import extract_signals
+from router.signals import TurnContext, extract_signals
 from router.classifier import RouterClassifier, bypass_classification
 from router.policy import choose_route
 from router.telemetry import TelemetryLog
-from router.config import TIER_DEFINITIONS, MODEL_PROFILES, CONFIDENCE_THRESHOLDS
 from router.fallback import recommend_subscription_fallback
+
+# NOTE: ``core.engine`` (MLX) is deliberately NOT imported at module
+# scope.  The production /api/route path never touches it; the legacy
+# /execute, /route-and-execute, and /run-parallel endpoints import it
+# lazily inside their handlers so importing this module — or serving a
+# production route — never loads MLX.
 
 app = FastAPI(title="RLCD Multi-Model Router")
 
@@ -64,6 +83,40 @@ _telemetry_log = TelemetryLog(
     )
 )
 
+# Long-lived, process-shared availability state.  Created lazily on
+# first use and NEVER recreated per request: cooldowns recorded by
+# /api/route/outcome must be visible to subsequent /api/route and
+# /api/router/status calls.
+_availability_store: Optional[AvailabilityStore] = None
+
+# Compact plain-dict snapshot of the most recent production route
+# (served by /api/router/status; never a live record).
+_last_route: Optional[Dict[str, Any]] = None
+
+
+def _get_availability_store() -> AvailabilityStore:
+    """The process-wide availability store (lazily constructed)."""
+    global _availability_store
+    if _availability_store is None:
+        _availability_store = AvailabilityStore()
+    return _availability_store
+
+
+def _availability_dict(profile_id: str) -> Dict[str, Any]:
+    """Plain-dict availability view of one profile (copy, never a record)."""
+    record = _get_availability_store().snapshot().get(profile_id)
+    if record is None:
+        return AvailabilityRecord(profile_id=profile_id).to_dict()
+    return record.to_dict()
+
+
+def _availability_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Plain-dict availability snapshot of every tracked profile."""
+    return {
+        profile_id: record.to_dict()
+        for profile_id, record in _get_availability_store().snapshot().items()
+    }
+
 
 class PredictRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -75,6 +128,11 @@ class PredictRequest(BaseModel):
 @app.post("/api/run-parallel")
 @app.post("/api/run-rlcd")
 def api_run_parallel(req: PredictRequest):
+    # Legacy/evaluation endpoint: MLX is imported only when explicitly
+    # called, never on the production route path.
+    from core.schema import StructuredSchema
+    from core.engine import run_parallel_generation
+
     try:
         schema = StructuredSchema(req.schema_def)
         temp = req.temperature if req.temperature is not None else 1.0
@@ -88,14 +146,86 @@ def api_run_parallel(req: PredictRequest):
 # ROUTER API
 # ===================================================================
 
+class TurnContextInput(BaseModel):
+    """Bounded per-session turn context supplied by the extension.
+
+    This is compact session state, not a transcript: every field is
+    bounded, and ``previous_prompt`` is additionally capped by
+    :class:`router.signals.TurnContext` itself.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    previous_prompt: str = Field(default="", max_length=65_536)
+    previous_capability: Optional[str] = Field(default=None, max_length=16)
+    previous_model: str = Field(default="", max_length=256)
+    previous_route_reason: list[str] = Field(default_factory=list, max_length=64)
+    task_depth: int = Field(default=0, ge=0, le=10_000)
+    files_involved: int = Field(default=0, ge=0, le=100_000)
+    task_failures: int = Field(default=0, ge=0, le=1_000)
+
+    def to_context(self) -> TurnContext:
+        capability = None
+        if self.previous_capability:
+            try:
+                capability = Capability[self.previous_capability.strip().upper()]
+            except KeyError:
+                # Unknown label: treat as missing history (conservative).
+                capability = None
+        return TurnContext(
+            previous_prompt=self.previous_prompt,
+            previous_capability=capability,
+            previous_model=self.previous_model,
+            previous_route_reason=tuple(self.previous_route_reason),
+            task_depth=self.task_depth,
+            files_involved=self.files_involved,
+            task_failures=self.task_failures,
+        )
+
+
+class RouteRequirementsInput(BaseModel):
+    """Hard execution requirements a candidate profile must satisfy."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    supports_tools: bool = False
+    supports_thinking: bool = False
+    minimum_context: int = Field(default=0, ge=0, le=10_000_000)
+    local_only: bool = False
+
+    def to_requirements(self) -> RouteRequirements:
+        return RouteRequirements(
+            supports_tools=self.supports_tools,
+            supports_thinking=self.supports_thinking,
+            minimum_context=self.minimum_context,
+            local_only=self.local_only,
+        )
+
+
 class RouteRequest(BaseModel):
+    """Production routing request.
+
+    Legacy fields (``runtime``, ``options``, ``model_override``) stay
+    accepted during migration; ``turn_context`` and ``requirements``
+    are the new bounded production inputs.
+    """
+
     prompt: str
     runtime: Dict[str, Any] = {}
     options: Dict[str, Any] = {}
     model_override: Optional[str] = None  # user-requested model profile name
+    turn_context: Optional[TurnContextInput] = None
+    requirements: Optional[RouteRequirementsInput] = None
 
 
 class OutcomeReport(BaseModel):
+    """Outcome of one routed attempt.
+
+    Legacy fields (``failure_reason``, ``actual_model``) stay accepted;
+    ``failure_category``, ``retry_after``, and ``candidate_profile``
+    drive the availability/task-outcome distinction.
+    """
+
     event_id: str
     status: str          # "success" | "failed"
     failure_reason: str = ""
@@ -103,6 +233,10 @@ class OutcomeReport(BaseModel):
     actual_model: str = ""
     latency_ms: float = 0.0
     cost: float = 0.0
+    # --- production fields ---
+    failure_category: Optional[str] = None   # FailureCategory value
+    retry_after: Optional[float] = None      # provider Retry-After seconds
+    candidate_profile: Optional[str] = None  # profile the attempt used
 
 
 class FallbackRecommendationRequest(BaseModel):
@@ -111,19 +245,23 @@ class FallbackRecommendationRequest(BaseModel):
 
 
 def _get_router_classifier() -> RouterClassifier:
-    """Lazily build the classifier.
+    """Lazily build the legacy RLCD classifier (MLX-backed).
+
+    Only the deprecated legacy endpoints (/api/route-and-execute) use
+    this; the production /api/route path never calls it.  MLX is
+    imported here — inside the function — so a production route never
+    loads it.
 
     Single-stage: Qwen3-Coder-30B-A3B-Instruct-4bit (~900 ms)
     Uses the full 11-field schema.  The 1.5B model was tested but
     can't reliably classify 11 fields (mean confidence ~0.73).
-    The Coder at ~900 ms is fast enough for routing.
-
-    The two-stage infrastructure (FAST_ROUTER_SCHEMA, etc.) is
-    preserved for future use with a better small model.
     """
     global _router_classifier
     if _router_classifier is not None:
         return _router_classifier
+
+    from core.schema import StructuredSchema
+    from core.engine import run_parallel_for_model
 
     # Use the Coder for classification (single stage)
     model_id = MODEL_PROFILES["rlcd_smart"].model_id
@@ -171,92 +309,257 @@ def _tier_for_profile(profile_name: str, profile: Any = None) -> str:
 
 @app.post("/api/route")
 def api_route(req: RouteRequest):
-    """Classify a prompt and return a routing decision.
+    """Classify a prompt and return an ordered, executable route.
 
-    This is the primary entry point for PI to decide which model
-    tier should handle a given task.  Returns:
-    - classification (what the task needs)
-    - tier (which routing tier to use)
-    - requirements (what the chosen tier must support)
-    - escalation config (what to try if it fails)
+    Production path (no MLX, no network required):
+
+      signal extraction -> deterministic / optional-Ollaya
+      classification -> policy candidate construction -> telemetry start
+
+    Returns:
+    - ``route_id`` (also the telemetry event id for /api/route/outcome)
+    - ``classification`` (router-owned TaskClassification dict)
+    - ``signals`` (deterministic runtime facts)
+    - ``decision`` (ordered candidates, exclusions with stable reason
+      codes, and legacy compatibility fields)
+    - ``override`` (present when ``model_override`` was requested)
+
+    Internal failures never 500 when a safe subscription fallback can be
+    resolved: the response carries a ``classifier="fallback"`` decision
+    containing the configured safe subscription profile.
     """
     try:
-        # --- User model override: skip classification entirely ---
-        if req.model_override:
-            profile_name = req.model_override
-            executor_profiles = sorted(
-                name for name, candidate in MODEL_PROFILES.items()
-                if candidate.role == "executor"
-            )
-            if profile_name not in MODEL_PROFILES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown model profile: {profile_name}. "
-                           f"Available: {', '.join(executor_profiles)}",
-                )
-            profile = MODEL_PROFILES[profile_name]
-            if profile.role != "executor":
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Override must name an executor model profile. "
-                           f"Available: {', '.join(executor_profiles)}",
-                )
-            # Pick the tier that contains this profile, or infer from profile
-            tier = _tier_for_profile(profile_name, profile)
-            cls_result = bypass_classification("user_model_override")
-            signals = extract_signals(
-                req.prompt,
-                prior_attempts=req.runtime.get("prior_attempts", 0),
-                prior_failures=req.runtime.get("prior_failures", 0),
-                tool_calls_so_far=req.runtime.get("tool_calls_so_far", 0),
-                deadline=req.runtime.get("deadline", "normal"),
-                user_hint=req.runtime.get("user_hint", ""),
-                repo_root=req.runtime.get("repo_root"),
-            )
-            from router.decision import RouteDecision, TierRequirement
-            td = TIER_DEFINITIONS.get(tier)
-            req_obj = TierRequirement(
-                minimum_capability=td.minimum_capability if td else "general",
-                requires_tools=td.supports_tools if td else (),
-                requires_verification=False,
-                allow_cloud=not (td.is_local if td else False),
-                allow_weak_models=True,
-                requires_web=td.supports_web if td else False,
-            )
-            decision = RouteDecision(
-                tier=tier,
-                eligible_models=(profile_name,),
-                requirements=req_obj,
-                classifier_used="user_model_override",
-                confidence=1.0,
-                critical_confidence=1.0,
-                reasons=("user_requested_model", f"override:{profile_name}"),
-                escalation_config={},
-            )
-            event = _telemetry_log.new_event(
-                prompt_hash=_prompt_hash(req.prompt),
-                prompt_chars=signals.prompt_chars,
-                estimated_tokens=signals.estimated_tokens,
-                classifier_used="user_model_override",
-                classification=cls_result.fields,
-                field_confidence={},
-                overall_confidence=1.0,
-                critical_confidence=1.0,
-                abstain=False,
-                selected_tier=tier,
-                eligible_models=list(decision.eligible_models),
-                reasons=["user_requested_model", f"override:{profile_name}"],
-                requirements=req_obj.to_dict(),
-                classifier_latency_ms=0.0,
-            )
-            _telemetry_log.record(event)
-            return {
-                "route_id": event.event_id,
-                "classification": cls_result.to_dict(),
-                "signals": signals.to_dict(),
-                "decision": decision.to_dict(),
-            }
+        return _route_request(req)
+    except HTTPException:
+        raise  # re-raise 4xx errors as-is
+    except Exception as exc:
+        return _route_fallback(req, exc)
 
+
+def _turn_context_from_request(req: RouteRequest) -> TurnContext:
+    """Build the bounded TurnContext from new or legacy request fields."""
+    if req.turn_context is not None:
+        return req.turn_context.to_context()
+    runtime = req.runtime or {}
+    # Legacy migration: derive bounded context from legacy runtime fields.
+    # ``prior_failures`` becomes ``task_failures`` (the deterministic
+    # classifier's escalation counter); other legacy fields feed the
+    # legacy signals only.
+    try:
+        task_failures = min(max(int(runtime.get("prior_failures", 0)), 0), 1000)
+    except (TypeError, ValueError):
+        task_failures = 0
+    return TurnContext(task_failures=task_failures)
+
+
+def _requirements_from_request(req: RouteRequest) -> RouteRequirements:
+    if req.requirements is not None:
+        return req.requirements.to_requirements()
+    return RouteRequirements()
+
+
+def _set_last_route(
+    route_id: str,
+    classification: TaskClassification,
+    decision: RouteDecision,
+) -> None:
+    """Store a compact plain-dict snapshot of the most recent route."""
+    global _last_route
+    _last_route = {
+        "route_id": route_id,
+        "classifier": classification.classifier,
+        "capability": classification.capability.name.lower(),
+        "confidence": classification.confidence,
+        "candidates": [c.profile_id for c in decision.candidates],
+        "reasons": list(decision.reasons),
+        "timestamp": time.time(),
+    }
+
+
+def _record_route_event(
+    req: RouteRequest,
+    signals,
+    classification: TaskClassification,
+    decision: RouteDecision,
+) -> str:
+    """Start telemetry for a route and return its route_id.
+
+    Telemetry is compatibility-minimal for now (Task 8 redesigns the
+    record shape) and must never fail a route: exceptions are swallowed.
+    """
+    route_id = uuid.uuid4().hex[:16]
+    try:
+        event = _telemetry_log.new_event(
+            event_id=route_id,
+            prompt_hash=_prompt_hash(req.prompt),
+            prompt_chars=signals.prompt_chars,
+            estimated_tokens=signals.estimated_tokens,
+            classifier_used=classification.classifier,
+            classification=classification.to_dict(),
+            field_confidence={},
+            overall_confidence=classification.confidence,
+            critical_confidence=classification.confidence,
+            abstain=classification.ambiguous,
+            selected_tier=decision.tier,
+            eligible_models=list(decision.eligible_models),
+            reasons=list(decision.reasons),
+            requirements=decision.requirements.to_dict(),
+            classifier_latency_ms=classification.latency_ms or 0.0,
+        )
+        _telemetry_log.record(event)
+    except Exception:
+        pass  # telemetry must never break routing
+    _set_last_route(route_id, classification, decision)
+    return route_id
+
+
+def _route_response(
+    route_id: str,
+    signals,
+    classification: TaskClassification,
+    decision: RouteDecision,
+    override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    response = {
+        "route_id": route_id,
+        "classification": classification.to_dict(),
+        "signals": signals.to_dict(),
+        "decision": decision.to_dict(),
+    }
+    if override is not None:
+        response["override"] = override
+    return response
+
+
+def _route_request(req: RouteRequest) -> Dict[str, Any]:
+    store = _get_availability_store()
+    context = _turn_context_from_request(req)
+    requirements = _requirements_from_request(req)
+    signals = extract_signals(
+        req.prompt,
+        prior_attempts=req.runtime.get("prior_attempts", 0),
+        prior_failures=req.runtime.get("prior_failures", 0),
+        tool_calls_so_far=req.runtime.get("tool_calls_so_far", 0),
+        deadline=req.runtime.get("deadline", "normal"),
+        user_hint=req.runtime.get("user_hint", ""),
+        repo_root=req.runtime.get("repo_root"),  # legacy, ignored (no-op)
+    )
+
+    # --- explicit override ---------------------------------------------
+    if req.model_override:
+        name = req.model_override
+        executor_profiles = sorted(
+            profile_name for profile_name, candidate in MODEL_PROFILES.items()
+            if candidate.role == "executor"
+        )
+        if name not in MODEL_PROFILES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model profile: {name}. "
+                       f"Available: {', '.join(executor_profiles)}",
+            )
+        profile = MODEL_PROFILES[name]
+        if profile.role != "executor":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Override must name an executor model profile. "
+                       f"Available: {', '.join(executor_profiles)}",
+            )
+
+        if store.is_available(name):
+            classification = TaskClassification(
+                capability=profile.capability,
+                confidence=1.0,
+                relationship=TaskRelationship.NEW_SUBSTANTIAL,
+                reasons=("user_requested_model", f"override:{name}"),
+                ambiguous=False,
+                classifier="user_model_override",
+            )
+            decision = build_route(
+                classification, {name: profile}, store, RouteRequirements(),
+            )
+            # Preserve the legacy tier label for overrides.
+            decision = replace(
+                decision, tier=_tier_for_profile(name, profile)
+            )
+            route_id = _record_route_event(req, signals, classification, decision)
+            return _route_response(
+                route_id, signals, classification, decision,
+                override={"requested": name, "available": True},
+            )
+
+        # Unavailable override: fall back automatically for this turn.
+        # The user's stored preference lives client-side (PI); the server
+        # never clears it, and the profile stays in cooldown untouched.
+        classification = classify_task(req.prompt, context)
+        decision = build_route(classification, MODEL_PROFILES, store, requirements)
+        decision = replace(
+            decision,
+            reasons=tuple(decision.reasons)
+            + (f"override_unavailable:{name}",),
+        )
+        route_id = _record_route_event(req, signals, classification, decision)
+        return _route_response(
+            route_id, signals, classification, decision,
+            override={"requested": name, "available": False},
+        )
+
+    # --- automatic production path ---------------------------------------
+    if req.options.get("bypass", False):
+        # Legacy option kept: skip classification, stay conservative.
+        classification = TaskClassification(
+            capability=Capability.NORMAL,
+            confidence=0.0,
+            relationship=TaskRelationship.AMBIGUOUS,
+            reasons=("caller_requested_bypass",),
+            ambiguous=True,
+            classifier="bypass",
+        )
+    else:
+        classification = classify_task(req.prompt, context)
+
+    decision = build_route(classification, MODEL_PROFILES, store, requirements)
+    route_id = _record_route_event(req, signals, classification, decision)
+    return _route_response(route_id, signals, classification, decision)
+
+
+def _fallback_profile(
+    store: AvailabilityStore, requirements: RouteRequirements,
+) -> Optional[tuple[str, Any]]:
+    """Resolve the configured safe fallback profile, or None.
+
+    Only real, configured, enabled, currently-available executor
+    profiles qualify; nothing is ever fabricated.  Privacy
+    (``local_only``) and tool requirements are honored.
+    """
+    preferred = (
+        AccessClass.LOCAL if requirements.local_only
+        else AccessClass.SUBSCRIPTION
+    )
+    pool = [
+        (name, profile)
+        for name, profile in MODEL_PROFILES.items()
+        if profile.role == "executor"
+        and profile.enabled
+        and profile.access_class is preferred
+        and store.is_available(name)
+        and (not requirements.supports_tools or profile.supports_tools)
+    ]
+    if not pool:
+        return None
+    return min(pool, key=lambda item: (item[1].priority, item[0]))
+
+
+def _route_fallback(req: RouteRequest, exc: Exception) -> Dict[str, Any]:
+    """Safe fallback after an internal route failure.
+
+    Returns a ``classifier="fallback"`` decision containing the
+    configured safe subscription (or local-only) profile when one can be
+    resolved.  Never fabricates unavailable or under-capable profiles.
+    """
+    try:
+        store = _get_availability_store()
+        requirements = _requirements_from_request(req)
         signals = extract_signals(
             req.prompt,
             prior_attempts=req.runtime.get("prior_attempts", 0),
@@ -264,54 +567,64 @@ def api_route(req: RouteRequest):
             tool_calls_so_far=req.runtime.get("tool_calls_so_far", 0),
             deadline=req.runtime.get("deadline", "normal"),
             user_hint=req.runtime.get("user_hint", ""),
-            repo_root=req.runtime.get("repo_root"),
         )
-
-        # Skip model loading if caller explicitly requests bypass
-        if req.options.get("bypass", False):
-            cls_result = bypass_classification("caller_requested_bypass")
+        classification = TaskClassification(
+            capability=Capability.NORMAL,
+            confidence=0.0,
+            relationship=TaskRelationship.AMBIGUOUS,
+            reasons=("internal_error", f"error:{type(exc).__name__}"),
+            ambiguous=True,
+            classifier="fallback",
+        )
+        safe = _fallback_profile(store, requirements)
+        if safe is not None:
+            name, profile = safe
+            candidates = (
+                Candidate(
+                    profile_id=name,
+                    provider=profile.provider,
+                    model=profile.model_id,
+                    capability=profile.capability,
+                    access_class=profile.access_class,
+                    priority=profile.priority,
+                ),
+            )
+            reasons = classification.reasons + ("safe_subscription_default",)
+            tier = (
+                "local_general" if requirements.local_only
+                else "cloud_standard"
+            )
         else:
-            classifier = _get_router_classifier()
-            cls_result = classifier.classify(req.prompt, signals)
-
-        decision = choose_route(
-            classification=cls_result.fields,
-            signals=signals,
-            overall_confidence=cls_result.overall_confidence,
-            critical_confidence=cls_result.critical_confidence,
-            classifier_used=cls_result.classifier_used,
-            abstain=cls_result.abstain,
+            candidates = ()
+            reasons = classification.reasons + ("no_eligible_candidates",)
+            tier = (
+                "local_general" if requirements.local_only
+                else "cloud_standard"
+            )
+        decision = RouteDecision(
+            tier=tier,
+            eligible_models=tuple(c.profile_id for c in candidates),
+            requirements=TierRequirement(
+                minimum_capability="general",
+                requires_tools=(),
+                requires_verification=False,
+                allow_cloud=not requirements.local_only,
+                allow_weak_models=False,
+                requires_web=False,
+            ),
+            classifier_used="fallback",
+            confidence=0.0,
+            critical_confidence=0.0,
+            reasons=reasons,
+            escalation_config={},
+            capability=Capability.NORMAL,
+            candidates=candidates,
+            excluded=(),
         )
-
-        # Record telemetry
-        event = _telemetry_log.new_event(
-            prompt_hash=_prompt_hash(req.prompt),
-            prompt_chars=signals.prompt_chars,
-            estimated_tokens=signals.estimated_tokens,
-            classifier_used=cls_result.classifier_used,
-            classification=cls_result.fields,
-            field_confidence={k: v for k, v in cls_result.field_confidence.items()},
-            overall_confidence=cls_result.overall_confidence,
-            critical_confidence=cls_result.critical_confidence,
-            abstain=cls_result.abstain,
-            selected_tier=decision.tier,
-            eligible_models=list(decision.eligible_models),
-            reasons=list(decision.reasons),
-            requirements=decision.requirements.to_dict(),
-            classifier_latency_ms=cls_result.latency_ms,
-        )
-        _telemetry_log.record(event)
-
-        return {
-            "route_id": event.event_id,
-            "classification": cls_result.to_dict(),
-            "signals": signals.to_dict(),
-            "decision": decision.to_dict(),
-        }
-    except HTTPException:
-        raise  # re-raise 4xx errors as-is
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        route_id = _record_route_event(req, signals, classification, decision)
+        return _route_response(route_id, signals, classification, decision)
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"route failed: {exc}")
 
 
 def _profile_name_for_model(model: str) -> str:
@@ -323,9 +636,37 @@ def _profile_name_for_model(model: str) -> str:
     return model
 
 
+def _coerce_failure_category(raw: str) -> FailureCategory:
+    """Explicitly coerce a JSON string failure category to FailureCategory.
+
+    Invalid values fail safely with a machine-readable 400 error —
+    never a crash, never a silent conservative cooldown.
+    """
+    try:
+        return FailureCategory(str(raw).strip().lower())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_failure_category",
+                "value": raw,
+                "valid_categories": [c.value for c in FailureCategory],
+            },
+        )
+
+
 @app.post("/api/route/outcome")
 def api_report_outcome(report: OutcomeReport):
-    """Report an outcome and recommend a switch when a subscription is exhausted."""
+    """Record an attempt outcome and update availability or task outcome.
+
+    Availability categories (rate limit, quota, auth, capacity,
+    provider-unknown) cool the provider down; task-side categories
+    (task failure, local tool failure) never touch provider
+    availability — the provider was available, the work failed.
+    Legacy ``failure_reason`` values that are not FailureCategory values
+    (e.g. "subscription_exhausted") keep their legacy behavior: no
+    availability change, plus the model-switch recommendation.
+    """
     for event in _telemetry_log.events:
         if event.event_id == report.event_id:
             event.status = report.status
@@ -336,7 +677,41 @@ def api_report_outcome(report: OutcomeReport):
             event.cost += report.cost
             _telemetry_log.record(event)
 
-            response = {"status": "recorded", "event_id": report.event_id}
+            # --- category resolution ---------------------------------
+            category: Optional[FailureCategory] = None
+            if report.failure_category:
+                category = _coerce_failure_category(report.failure_category)
+            elif report.failure_reason:
+                try:
+                    category = FailureCategory(report.failure_reason.strip().lower())
+                except ValueError:
+                    category = None  # legacy free-text reason: no cooldown
+
+            # --- availability / task-outcome update --------------------
+            profile_name = (
+                report.candidate_profile
+                or (report.actual_model and _profile_name_for_model(report.actual_model))
+                or None
+            )
+            availability = None
+            if profile_name:
+                store = _get_availability_store()
+                if report.status == "success":
+                    store.record_success(profile_name)
+                elif report.status == "failed" and category is not None:
+                    store.record_failure(
+                        profile_name, category, report.retry_after
+                    )
+                # failed without a recognizable category: conservative
+                # no-op — availability is never changed on a guess.
+                availability = _availability_dict(profile_name)
+
+            response = {
+                "status": "recorded",
+                "event_id": report.event_id,
+                "failure_category": category.value if category else None,
+                "availability": availability,
+            }
             if report.failure_reason == "subscription_exhausted":
                 response["model_switch"] = recommend_subscription_fallback(
                     event.eligible_models,
@@ -374,6 +749,48 @@ def api_router_config():
 def api_router_telemetry():
     """Return aggregate telemetry metrics."""
     return _telemetry_log.summary()
+
+
+@app.get("/api/router/status")
+def api_router_status():
+    """Compact router status for /router-status.
+
+    Returns model access/capability/availability (plain-dict copies —
+    never live AvailabilityRecord objects), the classifier configuration
+    including Ollaya enabled/health state, and the last route.
+    """
+    snapshot = _get_availability_store().snapshot()
+    models: Dict[str, Dict[str, Any]] = {}
+    for name, profile in MODEL_PROFILES.items():
+        record = snapshot.get(name)
+        models[name] = {
+            "provider": profile.provider,
+            "capability": profile.capability.name.lower(),
+            "access_class": profile.access_class.value,
+            "enabled": profile.enabled,
+            "priority": profile.priority,
+            "availability": (
+                record.to_dict() if record is not None
+                else AvailabilityRecord(profile_id=name).to_dict()
+            ),
+        }
+    return {
+        "service": "rlcd-router",
+        "classifier": {
+            "deterministic": True,
+            "ollaya": {
+                "enabled": OLLAYA_CONFIG.enabled,
+                "base_url": OLLAYA_CONFIG.base_url,
+                "model": OLLAYA_CONFIG.model,
+                "timeout_ms": OLLAYA_CONFIG.timeout_ms,
+                # No live probe on the status path (disabled by default;
+                # health of an enabled adapter is refined in Task 8/9).
+                "health": "disabled" if not OLLAYA_CONFIG.enabled else "unknown",
+            },
+        },
+        "models": models,
+        "last_route": dict(_last_route) if _last_route else None,
+    }
 
 
 # ===================================================================
@@ -427,6 +844,10 @@ def api_execute(req: ExecuteRequest):
       - elapsed_ms, total_tokens, tokens_per_second
     """
     try:
+        # Legacy execution endpoint: MLX is imported only when the
+        # endpoint is explicitly called, never on the production path.
+        from core.engine import MODEL_ID, run_text_generation
+
         # Resolve which model to use
         if req.model_id:
             model_id = req.model_id
@@ -486,6 +907,10 @@ def api_route_and_execute(req: RouteAndExecuteRequest):
     decision without executing (PI handles cloud tiers itself).
     """
     try:
+        # Legacy combined endpoint: MLX is imported only when the
+        # endpoint is explicitly called, never on the production path.
+        from core.engine import MODEL_ID, run_text_generation
+
         # --- User model override: skip classification ---
         if req.model_override:
             route_resp = api_route(RouteRequest(
@@ -620,6 +1045,9 @@ def api_route_and_execute(req: RouteAndExecuteRequest):
 @app.get("/api/models")
 def api_loaded_models():
     """List all models currently loaded in Apple Silicon memory."""
+    # Legacy endpoint: MLX is imported only when explicitly called.
+    from core.engine import list_loaded_models
+
     loaded = list_loaded_models()
     return {
         "loaded": loaded,

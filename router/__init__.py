@@ -14,7 +14,19 @@ from router.deterministic import (
     TaskClassification,
     classify_deterministically,
 )
-from router.decision import RouteDecision, TierRequirement
+from router.availability import (
+    AvailabilityRecord,
+    AvailabilityStore,
+    FailureCategory,
+    AVAILABILITY_CATEGORIES,
+    TASK_SIDE_CATEGORIES,
+)
+from router.decision import (
+    Candidate,
+    CandidateExclusion,
+    RouteDecision,
+    TierRequirement,
+)
 from router.config import (
     ModelProfile,
     MODEL_PROFILES,
@@ -23,7 +35,8 @@ from router.config import (
     TierDefinition,
     TIER_DEFINITIONS,
 )
-from router.policy import choose_route
+from router.policy import RouteRequirements, build_route, choose_route
+from router.ollaya import classify_task
 from router.escalation import ExecutionState, should_escalate, escalate
 from router.classifier import RouterClassifier, ClassificationResult
 from router.telemetry import RoutingEvent, TelemetryLog
@@ -35,6 +48,13 @@ __all__ = [
     "TaskRelationship",
     "TaskClassification",
     "classify_deterministically",
+    "AvailabilityRecord",
+    "AvailabilityStore",
+    "FailureCategory",
+    "AVAILABILITY_CATEGORIES",
+    "TASK_SIDE_CATEGORIES",
+    "Candidate",
+    "CandidateExclusion",
     "RouteDecision",
     "TierRequirement",
     "ModelProfile",
@@ -43,6 +63,9 @@ __all__ = [
     "CONFIDENCE_THRESHOLDS",
     "TierDefinition",
     "TIER_DEFINITIONS",
+    "RouteRequirements",
+    "build_route",
+    "classify_task",
     "choose_route",
     "ExecutionState",
     "should_escalate",

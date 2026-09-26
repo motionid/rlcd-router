@@ -10,10 +10,14 @@ from __future__ import annotations
 import sys
 import os
 import json
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.testclient import TestClient
+
+from router.availability import FailureCategory
+from router.config import MODEL_PROFILES, AccessClass, Capability
 
 
 # We need to patch the engine before importing the app so that
@@ -314,12 +318,9 @@ class TestRouterAPI:
         assert decision["capability"] in {
             "basic", "normal", "strong", "reasoning",
         }
-        # Task 2's additive serialization contract: the new keys are
-        # always present and well-typed. Candidates stay empty until the
-        # Task 5 policy populates them, so no exclusion behavior is
-        # asserted here; classifier exclusion is pinned non-vacuously by
-        # executor_candidates() unit tests and the override-catalog test.
+        # Task 5's policy now populates candidates on the production path.
         assert isinstance(decision["candidates"], list)
+        assert decision["candidates"]
         assert isinstance(decision["excluded"], list)
         for entry in decision["candidates"]:
             assert entry["capability"] in {
@@ -328,9 +329,12 @@ class TestRouterAPI:
             assert entry["access_class"] in {
                 "local", "subscription", "metered-cheap", "metered-expensive",
             }
+        for entry in decision["excluded"]:
+            assert isinstance(entry["reason"], str)
         # Compatibility fields retained until migration completes.
-        assert decision["tier"] == "local_coding"
-        assert decision["eligible_models"]
+        assert decision["eligible_models"] == [
+            c["profile_id"] for c in decision["candidates"]
+        ]
 
     def test_override_catalog_uses_supported_billing_order(self):
         response = self.client.get("/api/models/overrides")
@@ -356,13 +360,18 @@ class TestRouterAPI:
         assert "classification" in data
         assert "decision" in data
 
+        # Production path: deterministic classification, never the RLCD
+        # engine (which stays patched in this class to prove it is
+        # never invoked).
         cls = data["classification"]
-        assert cls["fields"]["task_type"] == "code_edit"
-        assert cls["classifier_used"] == "rlcd_fast"
+        assert cls["classifier"] == "deterministic"
+        assert cls["capability"] == "normal"
+        assert not [c for c in _call_log if c.startswith("rlcd:")]
 
         decision = data["decision"]
-        assert decision["tier"] == "local_coding"
-        assert "needs_coding" in decision["reasons"]
+        assert decision["capability"] == "normal"
+        assert decision["candidates"]
+        assert decision["tier"] == "cloud_standard"
 
     def test_route_with_runtime_prior_failures(self):
         resp = self.client.post("/api/route", json={
@@ -375,14 +384,25 @@ class TestRouterAPI:
         assert data["decision"]["tier"] == "cloud_standard"
 
     def test_route_bypass(self):
+        """options.bypass skips classification: conservative, subscription-safe."""
         resp = self.client.post("/api/route", json={
             "prompt": "Hello world",
             "options": {"bypass": True},
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["classification"]["classifier_used"] == "bypass"
-        assert data["classification"]["abstain"] is True
+        assert data["classification"]["classifier"] == "bypass"
+        assert data["classification"]["ambiguous"] is True
+        # No models, no network, no RLCD: conservative subscription-first
+        # route with paid access excluded by uncertainty.
+        candidates = data["decision"]["candidates"]
+        assert candidates
+        assert candidates[0]["access_class"] == "subscription"
+        assert all(
+            c["access_class"] in ("subscription", "local")
+            for c in candidates
+        )
+        assert _call_log == []
 
     def test_route_config(self):
         resp = self.client.get("/api/route/config")
@@ -420,16 +440,15 @@ class TestRouterAPI:
     # ------------------------------------------------------------------
 
     def test_route_uses_fast_when_confident(self):
-        """Fast classifier is confident → no smart classifier call."""
+        """Production routing never consults the RLCD cascade."""
         resp = self.client.post("/api/route", json={
             "prompt": "Fix the login bug in auth.py",
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["classification"]["classifier_used"] == "rlcd_fast"
-        # Should have called the fast model
-        fast_calls = [c for c in _call_log if "rlcd:" in c ]
-        assert len(fast_calls) >= 1
+        assert data["classification"]["classifier"] == "deterministic"
+        # The engine is patched in this class; nothing may call it.
+        assert _call_log == []
 
     # ------------------------------------------------------------------
     # /api/execute
@@ -519,3 +538,370 @@ class TestRouterAPI:
         assert "available_profiles" in data
         assert "rlcd_fast" in data["available_profiles"]
         assert "rlcd_smart" in data["available_profiles"]
+
+
+# ===================================================================
+# Production router API — deterministic route, outcome, and status
+#
+# These tests deliberately do NOT patch or import the RLCD engine:
+# the production path must work without MLX and without network.
+# ===================================================================
+
+class TestProductionRouterAPI:
+    def setup_method(self):
+        import importlib
+        import server.app as app_module
+        self.app_module = importlib.reload(app_module)
+        self.client = TestClient(self.app_module.app)
+
+    def _route(self, prompt, **extra):
+        payload = {"prompt": prompt}
+        payload.update(extra)
+        return self.client.post("/api/route", json=payload)
+
+    # ------------------------------------------------------------------
+    # Production /api/route
+    # ------------------------------------------------------------------
+
+    def test_route_obvious_request_does_not_load_rlcd(self):
+        """Subprocess proof: an obvious route never imports core.engine."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = (
+            "import sys, os\n"
+            "sys.path.insert(0, os.getcwd())\n"
+            "from fastapi.testclient import TestClient\n"
+            "import server.app\n"
+            "client = TestClient(server.app.app)\n"
+            "resp = client.post('/api/route', json={\n"
+            "    'prompt': 'rename the variable foo to bar'})\n"
+            "assert resp.status_code == 200, resp.text\n"
+            "body = resp.json()\n"
+            "assert body['classification']['classifier'] == 'deterministic'\n"
+            "for module in ('core.engine', 'core.engine_mlx', 'mlx'):\n"
+            "    assert module not in sys.modules, module\n"
+            "print('OK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo_root, capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, (
+            f"subprocess failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
+
+    def test_route_ambiguous_request_works_with_ollaya_disabled(self):
+        resp = self._route("hi")
+        assert resp.status_code == 200
+        body = resp.json()
+        cls = body["classification"]
+        assert cls["classifier"] == "deterministic"
+        assert cls["ambiguous"] is True
+        assert cls["capability"] == "normal"
+        candidates = body["decision"]["candidates"]
+        assert candidates
+        # Ambiguity never selects paid access; subscription first.
+        assert all(
+            c["access_class"] in ("subscription", "local")
+            for c in candidates
+        )
+        assert candidates[0]["access_class"] == "subscription"
+        assert body["decision"]["tier"] == "cloud_standard"
+
+    def test_route_returns_ordered_candidates_and_exclusions(self):
+        resp = self._route(
+            "Debug the failing test suite across the repository",
+            requirements={"supports_tools": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["classification"]["classifier"] == "deterministic"
+        decision = resp.json()["decision"]
+        candidates = decision["candidates"]
+        assert candidates
+
+        # Ordering: access-class rank, then priority, then name.
+        eligible = [
+            (name, profile)
+            for name, profile in MODEL_PROFILES.items()
+            if profile.role == "executor" and profile.enabled
+            and profile.capability >= Capability.STRONG
+            and profile.supports_tools
+            and profile.access_class is AccessClass.SUBSCRIPTION
+        ]
+        expected = [
+            name for name, _ in
+            sorted(eligible, key=lambda item: (item[1].priority, item[0]))
+        ]
+        assert [c["profile_id"] for c in candidates] == expected
+
+        excluded = {e["profile_id"]: e["reason"] for e in decision["excluded"]}
+        assert excluded["rlcd_smart"] == "classifier_profile"
+        assert excluded["rlcd_fast"] == "classifier_profile"
+        assert excluded["local_coding"] == "access_class_excluded"
+        assert excluded["gpt_6_luna"] == "insufficient_capability"
+
+    def test_route_local_only_requirement_returns_local_candidates_only(self):
+        resp = self._route(
+            "Summarize this output for me",
+            requirements={"local_only": True},
+        )
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+        candidates = decision["candidates"]
+        assert candidates
+        assert all(c["access_class"] == "local" for c in candidates)
+        assert candidates[0]["profile_id"] == "local_coding"
+
+    def test_uncertain_route_with_no_eligible_candidates_returns_empty(self):
+        store = self.app_module._get_availability_store()
+        for name, profile in MODEL_PROFILES.items():
+            if profile.access_class is AccessClass.LOCAL:
+                store.record_failure(name, FailureCategory.CAPACITY)
+        resp = self._route("hi", requirements={"local_only": True})
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+        assert decision["candidates"] == []
+        assert decision["eligible_models"] == []
+        assert "no_eligible_candidates" in decision["reasons"]
+
+    def test_router_exception_returns_safe_fallback_decision(self):
+        app = self.app_module
+
+        def boom(prompt, context, ollaya=None):
+            raise RuntimeError("classifier exploded")
+
+        original = getattr(app, "classify_task", None)
+        app.classify_task = boom
+        try:
+            resp = self._route("Fix the login bug")
+        finally:
+            if original is not None:
+                app.classify_task = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        decision = body["decision"]
+        assert decision["classifier_used"] == "fallback"
+        assert "internal_error" in decision["reasons"]
+        candidates = decision["candidates"]
+        assert candidates
+        # A real, configured, eligible subscription profile — never paid,
+        # never fabricated.
+        assert all(
+            c["access_class"] == "subscription" for c in candidates
+        )
+        assert body["classification"]["classifier"] == "fallback"
+
+    def test_no_network_classifier_is_required(self):
+        import urllib.request
+
+        def no_network(*args, **kwargs):
+            raise AssertionError("production routing must not touch the network")
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = no_network
+        try:
+            resp = self._route("hi")
+        finally:
+            urllib.request.urlopen = original
+        assert resp.status_code == 200
+        assert resp.json()["classification"]["classifier"] == "deterministic"
+
+    # ------------------------------------------------------------------
+    # Explicit overrides
+    # ------------------------------------------------------------------
+
+    def test_explicit_override_returns_only_requested_available_profile(self):
+        resp = self._route(
+            "Review this migration plan",
+            model_override="gpt_5_6_terra",
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        candidates = body["decision"]["candidates"]
+        assert len(candidates) == 1
+        assert candidates[0]["profile_id"] == "gpt_5_6_terra"
+        assert candidates[0]["access_class"] == "subscription"
+        assert body["decision"]["eligible_models"] == ["gpt_5_6_terra"]
+        assert body["decision"]["classifier_used"] == "user_model_override"
+        assert body["override"] == {
+            "requested": "gpt_5_6_terra",
+            "available": True,
+        }
+
+    def test_unavailable_override_falls_back_without_clearing_preference(self):
+        store = self.app_module._get_availability_store()
+        store.record_failure("gpt_5_6_terra", FailureCategory.QUOTA)
+
+        resp = self._route(
+            "Review this migration plan",
+            model_override="gpt_5_6_terra",
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["override"] == {
+            "requested": "gpt_5_6_terra",
+            "available": False,
+        }
+        ids = [c["profile_id"] for c in body["decision"]["candidates"]]
+        assert ids
+        assert "gpt_5_6_terra" not in ids
+        assert "override_unavailable:gpt_5_6_terra" in body["decision"]["reasons"]
+        # No server-side preference clear: the profile stays in cooldown
+        # untouched, so a future turn can retry the override.
+        assert store.is_available("gpt_5_6_terra") is False
+        assert store.snapshot()["gpt_5_6_terra"].reason is FailureCategory.QUOTA
+
+    # ------------------------------------------------------------------
+    # /api/route/outcome
+    # ------------------------------------------------------------------
+
+    def _first_route_candidate(self, prompt="Fix the login bug in auth.py"):
+        resp = self._route(prompt)
+        assert resp.status_code == 200
+        body = resp.json()
+        candidates = body["decision"]["candidates"]
+        assert candidates
+        return body["route_id"], candidates[0]["profile_id"]
+
+    def test_outcome_rate_limit_updates_availability_not_task_capability(self):
+        route_id, profile_id = self._first_route_candidate()
+
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "rate_limit",
+            "candidate_profile": profile_id,
+            "retry_after": 30.0,
+        })
+        assert resp.status_code == 200
+        availability = resp.json()["availability"]
+        assert availability["status"] == "cooldown"
+        assert availability["reason"] == "rate_limit"
+        assert availability["retry_after"] == 30.0
+
+        # Provider failure cools the profile down; it must not escalate
+        # the task capability.
+        resp2 = self._route("Fix the login bug in auth.py")
+        body2 = resp2.json()
+        assert body2["decision"]["capability"] == "normal"
+        ids = [c["profile_id"] for c in body2["decision"]["candidates"]]
+        assert profile_id not in ids
+        excluded = {
+            e["profile_id"]: e["reason"] for e in body2["decision"]["excluded"]
+        }
+        assert excluded[profile_id] == "unavailable_cooldown"
+
+    def test_outcome_task_failure_updates_task_failure_not_availability(self):
+        route_id, profile_id = self._first_route_candidate()
+
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "task_failure",
+            "candidate_profile": profile_id,
+        })
+        assert resp.status_code == 200
+        out = resp.json()
+        availability = out["availability"]
+        # The provider was available; the work failed. No cooldown.
+        assert availability["status"] == "available"
+        assert availability["cooldown_until"] is None
+        assert availability["failure_count"] == 1
+        # Telemetry records the failed attempt.
+        events = [
+            e for e in self.app_module._telemetry_log.events
+            if e.event_id == route_id
+        ]
+        assert events and events[-1].status == "failed"
+        # The profile stays eligible on the next turn.
+        resp2 = self._route("Fix the login bug in auth.py")
+        ids = [
+            c["profile_id"]
+            for c in resp2.json()["decision"]["candidates"]
+        ]
+        assert profile_id in ids
+
+    def test_outcome_success_clears_cooldown(self):
+        route_id, profile_id = self._first_route_candidate()
+        store = self.app_module._get_availability_store()
+        store.record_failure(profile_id, FailureCategory.RATE_LIMIT)
+        assert store.is_available(profile_id) is False
+
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "success",
+            "candidate_profile": profile_id,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["availability"]["status"] == "available"
+        assert store.is_available(profile_id) is True
+
+    def test_outcome_invalid_failure_category_is_machine_readable_error(self):
+        route_id, profile_id = self._first_route_candidate()
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "not_a_category",
+            "candidate_profile": profile_id,
+        })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["error"] == "invalid_failure_category"
+        assert detail["value"] == "not_a_category"
+        assert "rate_limit" in detail["valid_categories"]
+        # Nothing was recorded: the store stays untouched.
+        store = self.app_module._get_availability_store()
+        assert store.is_available(profile_id) is True
+
+    # ------------------------------------------------------------------
+    # /api/router/status
+    # ------------------------------------------------------------------
+
+    def test_status_reports_classifier_and_cooldowns(self):
+        resp = self.client.get("/api/router/status")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["classifier"]["deterministic"] is True
+        ollaya = body["classifier"]["ollaya"]
+        assert ollaya["enabled"] is False
+        assert ollaya["health"] == "disabled"
+
+        assert "local_coding" in body["models"]
+        local_coding = body["models"]["local_coding"]
+        assert local_coding["capability"] == "strong"
+        assert local_coding["access_class"] == "local"
+        assert local_coding["availability"]["status"] == "available"
+
+        # No route yet: last_route is null.
+        assert body["last_route"] is None
+
+        # A cooldown shows up in the status snapshot.
+        store = self.app_module._get_availability_store()
+        store.record_failure("gpt_6_luna", FailureCategory.RATE_LIMIT)
+        resp2 = self.client.get("/api/router/status")
+        avail = resp2.json()["models"]["gpt_6_luna"]["availability"]
+        assert avail["status"] == "cooldown"
+        assert avail["reason"] == "rate_limit"
+        assert avail["cooldown_until"] is not None
+
+        # The last route is reported compactly.
+        self._route("Fix the login bug in auth.py")
+        resp3 = self.client.get("/api/router/status")
+        last = resp3.json()["last_route"]
+        assert last["classifier"] == "deterministic"
+        assert last["capability"] == "normal"
+        assert isinstance(last["candidates"], list)
+        assert last["candidates"]
+
+    def test_status_availability_entries_are_plain_copies(self):
+        app = self.app_module
+        store = app._get_availability_store()
+        store.record_failure("gpt_6_luna", FailureCategory.RATE_LIMIT)
+        snapshot = app._availability_snapshot()
+        entry = snapshot["gpt_6_luna"]
+        assert type(entry) is dict
+        assert entry == store.snapshot()["gpt_6_luna"].to_dict()
+        # Mutating the serialized copy must never touch live state.
+        entry["status"] = "available"
+        assert store.snapshot()["gpt_6_luna"].status == "cooldown"
