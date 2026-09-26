@@ -905,3 +905,190 @@ class TestProductionRouterAPI:
         # Mutating the serialized copy must never touch live state.
         entry["status"] = "available"
         assert store.snapshot()["gpt_6_luna"].status == "cooldown"
+
+    # ------------------------------------------------------------------
+    # Fix round 1: override compatibility under caller requirements
+    # ------------------------------------------------------------------
+
+    def test_local_only_cloud_override_returns_no_cloud_candidate(self):
+        """Privacy regression: local_only + cloud override never yields cloud."""
+        resp = self._route(
+            "Summarize this output for me",
+            model_override="gpt_5_6_terra",
+            requirements={"local_only": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # The override preference is preserved in metadata, not cleared.
+        assert body["override"]["requested"] == "gpt_5_6_terra"
+        assert body["override"]["available"] is True
+        assert body["override"]["compatible"] is False
+        assert body["override"]["reason"] == "local_only_blocks_remote"
+        assert (
+            "override_incompatible:local_only_blocks_remote"
+            in body["decision"]["reasons"]
+        )
+        candidates = body["decision"]["candidates"]
+        assert candidates
+        assert all(c["access_class"] == "local" for c in candidates)
+        assert "gpt_5_6_terra" not in [
+            c["profile_id"] for c in candidates
+        ]
+
+    def test_override_incompatible_with_tools_reports_stable_reason(self):
+        resp = self._route(
+            "Fix the login bug in auth.py",
+            model_override="local_general",   # supports_tools=False
+            requirements={"supports_tools": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["override"] == {
+            "requested": "local_general",
+            "available": True,
+            "compatible": False,
+            "reason": "tools_unsupported",
+        }
+        assert "override_incompatible:tools_unsupported" in body["decision"]["reasons"]
+        ids = [c["profile_id"] for c in body["decision"]["candidates"]]
+        assert ids
+        assert "local_general" not in ids
+
+    def test_compatible_override_metadata_preserved(self):
+        resp = self._route(
+            "Review this migration plan",
+            model_override="gpt_5_6_terra",
+            requirements={"supports_tools": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["override"] == {
+            "requested": "gpt_5_6_terra",
+            "available": True,
+        }
+        assert len(body["decision"]["candidates"]) == 1
+        assert body["decision"]["candidates"][0]["profile_id"] == "gpt_5_6_terra"
+
+    # ------------------------------------------------------------------
+    # Fix round 1: outcome handling independent of telemetry
+    # ------------------------------------------------------------------
+
+    def test_outcome_updates_availability_when_telemetry_fails(self):
+        app = self.app_module
+
+        def boom(event):
+            raise RuntimeError("telemetry backend down")
+
+        app._telemetry_log.record = boom
+        resp = self._route("Fix the login bug in auth.py")
+        assert resp.status_code == 200  # telemetry failure never breaks routing
+        body = resp.json()
+        route_id = body["route_id"]
+        profile_id = body["decision"]["candidates"][0]["profile_id"]
+
+        out = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "rate_limit",
+            "candidate_profile": profile_id,
+        })
+        assert out.status_code == 200
+        assert out.json()["availability"]["status"] == "cooldown"
+        assert out.json()["availability"]["reason"] == "rate_limit"
+
+        # The cooldown is visible to the next route even though telemetry
+        # never recorded the event.
+        resp2 = self._route("Fix the login bug in auth.py")
+        ids = [
+            c["profile_id"] for c in resp2.json()["decision"]["candidates"]
+        ]
+        assert profile_id not in ids
+
+    def test_route_index_is_bounded_with_oldest_eviction(self):
+        app = self.app_module
+        index = app._route_index
+        index.clear()
+        for i in range(1030):
+            app._register_route_index(f"route-{i}", ["gpt_6_luna"])
+        assert app._ROUTE_INDEX_MAX == 1024
+        assert len(index) == 1024
+        # Deterministic oldest-first eviction: the first six are gone,
+        # the newest survive.
+        assert "route-0" not in index
+        assert "route-5" not in index
+        assert "route-6" in index
+        assert "route-1029" in index
+
+    # ------------------------------------------------------------------
+    # Fix round 1: safe fallback capability validation
+    # ------------------------------------------------------------------
+
+    def _route_with_broken_policy(self, prompt, **extra):
+        app = self.app_module
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("policy exploded")
+
+        original = app.build_route
+        app.build_route = boom
+        try:
+            return self._route(prompt, **extra)
+        finally:
+            app.build_route = original
+
+    def test_fallback_respects_minimum_task_capability(self):
+        resp = self._route_with_broken_policy(
+            "Prove the correctness of the invariant with a formal proof "
+            "and a derivation of the bound"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["classification"]["capability"] == "reasoning"
+        decision = body["decision"]
+        assert decision["classifier_used"] == "fallback"
+        candidates = decision["candidates"]
+        assert candidates
+        assert all(
+            c["capability"] in ("reasoning",) for c in candidates
+        )
+
+    def test_fallback_capability_rejection_is_terminal(self):
+        store = self.app_module._get_availability_store()
+        for name, profile in MODEL_PROFILES.items():
+            if (
+                profile.access_class is AccessClass.SUBSCRIPTION
+                and profile.capability >= Capability.REASONING
+            ):
+                store.record_failure(name, FailureCategory.QUOTA)
+        resp = self._route_with_broken_policy(
+            "Prove the correctness of the invariant with a formal proof"
+        )
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+        assert decision["candidates"] == []
+        assert decision["classifier_used"] == "fallback"
+        assert "no_eligible_candidates" in decision["reasons"]
+
+    def test_fallback_rejects_thinking_requirement_without_capable_profiles(self):
+        store = self.app_module._get_availability_store()
+        for name, profile in MODEL_PROFILES.items():
+            if profile.supports_thinking:
+                store.record_failure(name, FailureCategory.QUOTA)
+        resp = self._route_with_broken_policy(
+            "Fix the login bug in auth.py",
+            requirements={"supports_thinking": True},
+        )
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+        assert decision["candidates"] == []
+        assert "no_eligible_candidates" in decision["reasons"]
+
+    def test_fallback_rejects_unsatisfiable_context_requirement(self):
+        resp = self._route_with_broken_policy(
+            "Fix the login bug in auth.py",
+            requirements={"minimum_context": 2_000_000},
+        )
+        assert resp.status_code == 200
+        decision = resp.json()["decision"]
+        assert decision["candidates"] == []
+        assert "no_eligible_candidates" in decision["reasons"]
