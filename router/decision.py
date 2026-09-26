@@ -81,8 +81,13 @@ class CandidateExclusion:
 class RouteDecision:
     """The complete routing decision returned to PI.
 
-    ``tier`` and ``eligible_models`` are legacy compatibility fields kept
-    until the tier-based migration completes; new consumers should read
+    ``build_route`` (router.policy) populates ``capability`` plus the
+    ordered, executable ``candidates`` and the ``excluded`` records with
+    stable reason codes.  ``tier`` and ``eligible_models`` are legacy
+    compatibility fields derived from the candidates (tier from the top
+    candidate's access class and the required capability, eligible_models
+    from the ordered candidate profile ids) and are kept until the
+    tier-based migration completes; new consumers should read
     ``capability`` / ``candidates`` / ``excluded`` instead.
     """
 
