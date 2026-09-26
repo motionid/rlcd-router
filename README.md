@@ -436,6 +436,14 @@ Even when enabled, metered access is only reachable after all suitable
 subscription candidates (per the capability-specific access order), and
 uncertain classifications never select it.
 
+**Disabled profiles are not valid router override choices**: while a
+profile is disabled it does not appear in `GET /api/models/overrides`, and
+a direct `model_override` naming it is reported incompatible
+(`profile_disabled`) with the turn routed from the normal pool — the
+preference is kept in metadata but the disabled profile never becomes the
+selected candidate. Enable a profile (`ROUTER_ENABLE_<NAME>=1`) to make it
+an override choice again.
+
 ### Ollaya
 
 | Variable | Default | Meaning |
@@ -493,7 +501,7 @@ uncertain classifications never select it.
 | `GET` | `/api/router/status` | Compact status: per-profile access/capability/enabled/availability, Ollaya config (no secrets), cooldown durations, last route |
 | `GET` | `/api/route/telemetry` | Aggregate routing metrics |
 | `POST` | `/api/models/recommend` | Subscription switch recommendation after quota exhaustion |
-| `GET` | `/api/models/overrides` | Valid override targets grouped by billing |
+| `GET` | `/api/models/overrides` | Valid override targets grouped by billing (enabled executors only — disabled profiles, e.g. the metered examples, are excluded until enabled) |
 | `POST` | `/api/run-parallel` (alias `/api/run-rlcd`) | **RLCD evaluation only**: arbitrary constrained classification (loads MLX) |
 | `POST` | `/api/execute` | *Deprecated* legacy local execution |
 | `POST` | `/api/route-and-execute` | *Deprecated* legacy route + local execution |

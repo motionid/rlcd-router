@@ -1106,6 +1106,110 @@ class TestProductionRouterAPI:
         )
 
     # ------------------------------------------------------------------
+    # Fix round 1 (Task 11 review): disabled profiles are not override
+    # choices until explicitly enabled
+    # ------------------------------------------------------------------
+
+    def _enabled_metered_registry(self):
+        """The live registry with the two metered examples force-enabled
+        (controlled test config; the module-level MODEL_PROFILES stays
+        untouched and monkeypatch restores the module attribute)."""
+        from dataclasses import replace as _replace
+        enabled = dict(self.app_module.MODEL_PROFILES)
+        for name in ("openrouter_qwen", "premium_fallback"):
+            enabled[name] = _replace(enabled[name], enabled=True)
+        return enabled
+
+    def test_override_catalog_excludes_disabled_profiles(self):
+        """The disabled metered examples are NOT valid router override
+        choices: the catalog must not list any enabled=False executor."""
+        resp = self.client.get("/api/models/overrides")
+        assert resp.status_code == 200
+        groups = resp.json()["models"]
+        profile_names = {
+            model["profile_name"]
+            for models in groups.values()
+            for model in models
+        }
+        assert "openrouter_qwen" not in profile_names
+        assert "premium_fallback" not in profile_names
+        # The filter is enablement-based, not name-based: enabled profiles
+        # (local, subscription) all remain listed.
+        assert "local_coding" in profile_names
+        assert "gpt_6_luna" in profile_names
+
+    def test_override_catalog_includes_enabled_metered_example(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            self.app_module, "MODEL_PROFILES",
+            self._enabled_metered_registry(),
+        )
+        resp = self.client.get("/api/models/overrides")
+        assert resp.status_code == 200
+        groups = resp.json()["models"]
+        profile_names = {
+            model["profile_name"]
+            for models in groups.values()
+            for model in models
+        }
+        # Enabled (even metered) profiles are valid override choices again.
+        assert "openrouter_qwen" in profile_names
+        assert "premium_fallback" in profile_names
+        assert groups["paid"][0]["profile_name"] == "openrouter_qwen"
+
+    def test_override_disabled_profile_never_becomes_selected_candidate(self):
+        """A direct /api/route override naming a disabled profile is
+        fail-safe: the preference is kept in metadata, but the profile is
+        reported incompatible and the turn routes from the normal pool —
+        the disabled profile never becomes the selected candidate."""
+        resp = self._route(
+            "Review this migration plan",
+            model_override="openrouter_qwen",
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["override"] == {
+            "requested": "openrouter_qwen",
+            "available": True,
+            "compatible": False,
+            "reason": "profile_disabled",
+        }
+        assert (
+            "override_incompatible:profile_disabled"
+            in body["decision"]["reasons"]
+        )
+        ids = [c["profile_id"] for c in body["decision"]["candidates"]]
+        assert ids
+        assert "openrouter_qwen" not in ids
+        assert all(
+            c["access_class"] in ("subscription", "local")
+            for c in body["decision"]["candidates"]
+        )
+
+    def test_override_enabled_metered_example_routes_to_requested_profile(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            self.app_module, "MODEL_PROFILES",
+            self._enabled_metered_registry(),
+        )
+        resp = self._route(
+            "Review this migration plan",
+            model_override="openrouter_qwen",
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        candidates = body["decision"]["candidates"]
+        assert [c["profile_id"] for c in candidates] == ["openrouter_qwen"]
+        assert candidates[0]["access_class"] == "metered-cheap"
+        assert body["decision"]["classifier_used"] == "user_model_override"
+        assert body["override"] == {
+            "requested": "openrouter_qwen",
+            "available": True,
+        }
+
+    # ------------------------------------------------------------------
     # Fix round 1: override compatibility under caller requirements
     # ------------------------------------------------------------------
 

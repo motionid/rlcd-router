@@ -1395,11 +1395,18 @@ def api_loaded_models():
 
 @app.get("/api/models/overrides")
 def api_model_overrides():
-    """List model profiles available for user override, grouped by billing."""
+    """List model profiles available for user override, grouped by billing.
+
+    Classifier profiles and disabled profiles (e.g. the metered examples
+    before real credentials/model IDs are configured and they are
+    explicitly enabled) are not valid override choices and are not listed;
+    enable a profile (ROUTER_ENABLE_<NAME>=1) to make it appear here."""
     groups: Dict[str, list] = {}
     for name, profile in MODEL_PROFILES.items():
         if profile.role == "classifier":
             continue  # don't expose classifiers as override targets
+        if not profile.enabled:
+            continue  # disabled profiles are not valid override choices
         billing = profile.billing
         if billing not in groups:
             groups[billing] = []
