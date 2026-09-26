@@ -470,6 +470,23 @@ def choose_route(
                 decision.requirements, requires_verification=True
             ),
         )
+
+    # Legacy research tier: fresh_information == "required" always
+    # produced the cloud_research tier with a web requirement (privacy
+    # outranking it, above).  build_route() has no research tier, so the
+    # deprecated adapter re-derives it here — the new policy's
+    # capability/access ordering and candidates are untouched.
+    if cls.get("fresh_information") == "required" and not requirements.local_only:
+        decision = replace(
+            decision,
+            tier="cloud_research",
+            requirements=replace(
+                decision.requirements,
+                minimum_capability="research",
+                requires_web=True,
+            ),
+            escalation_config=_escalation_config("cloud_research", requirements),
+        )
     return decision
 
 

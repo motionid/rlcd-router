@@ -633,6 +633,38 @@ class TestLegacyAdapter:
         assert decision.candidates[0].access_class is AccessClass.SUBSCRIPTION
         assert decision.capability is Capability.NORMAL
 
+    def test_fresh_information_required_goes_cloud_research(self):
+        # Legacy compatibility pin: research work keeps the old
+        # cloud_research tier and web requirement in the deprecated
+        # adapter, even though build_route() itself has no research tier.
+        cls = _default_classification(
+            task_type="research",
+            fresh_information="required",
+        )
+        with pytest.warns(DeprecationWarning):
+            decision = choose_route(cls, _signals(), overall_confidence=0.95)
+        assert decision.tier == "cloud_research"
+        assert decision.requirements.requires_web is True
+        assert decision.requirements.minimum_capability == "research"
+        assert "needs_fresh_information" in decision.reasons
+        # The new candidate field remains populated and subscription-backed.
+        assert decision.candidates
+        assert decision.candidates[0].access_class is AccessClass.SUBSCRIPTION
+        assert decision.escalation_config.get("allow_cloud_fallback") is True
+
+    def test_fresh_information_local_only_stays_local(self):
+        # Legacy precedence: privacy outranks research — local_only never
+        # produces a cloud tier.
+        cls = _default_classification(
+            task_type="research",
+            fresh_information="required",
+            privacy="local_only",
+        )
+        with pytest.warns(DeprecationWarning):
+            decision = choose_route(cls, _signals(), overall_confidence=0.95)
+        assert decision.tier.startswith("local_")
+        assert decision.requirements.allow_cloud is False
+
     def test_deep_reasoning_routes_to_reasoning_subscription(self):
         cls = _default_classification(
             task_type="planning",
