@@ -14,10 +14,10 @@ from typing import Any, Mapping
 
 
 # Local models already downloaded and managed by oMLX (see ~/.omlx/settings.json
-# -> model.model_dirs). Pointing model_id at these paths lets mlx_lm.load()
-# reuse the exact weights oMLX serves instead of re-downloading a duplicate
-# copy into ~/.cache/huggingface. Override with OMLX_MODELS_DIR if the layout
-# differs on another machine (e.g. a home machine with a different model set).
+# -> model.model_dirs). Executor model_id values match Pi's dynamic oMLX
+# registry; deprecated router-owned MLX execution uses each profile's separate
+# legacy_model_id path under this directory. Override OMLX_MODELS_DIR or the
+# LEGACY_LOCAL_* variables when the on-disk layout differs.
 OMLX_MODELS_DIR = os.getenv("OMLX_MODELS_DIR", os.path.expanduser("~/.omlx/models"))
 
 
@@ -63,6 +63,9 @@ class ModelProfile:
     capabilities: tuple[str, ...]      # legacy: e.g. ("coding", "tools")
     latency_class: str                 # "fast" | "medium" | "slow"
     notes: str = ""
+    # Optional mlx_lm path used only by deprecated router-owned execution.
+    # Production candidates always serialize model_id for Pi's registry.
+    legacy_model_id: str | None = None
     # --- capability/access registry fields ---
     capability: Capability = Capability.NORMAL
     access_class: AccessClass = AccessClass.LOCAL
@@ -195,12 +198,16 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
     "local_general": ModelProfile(
         model_id=os.getenv(
             "LOCAL_GENERAL_MODEL",
-            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3.8-27B-4bit",
+            "Qwen3.8-27B-MLX-4bit",
         ),
         role="executor",
         provider="omlx",
         capabilities=("general", "reasoning"),
         latency_class="slow",
+        legacy_model_id=os.getenv(
+            "LEGACY_LOCAL_GENERAL_MODEL",
+            f"{OMLX_MODELS_DIR}/lmstudio-community/Qwen3.8-27B-MLX-4bit",
+        ),
         capability=Capability.STRONG,
         access_class=AccessClass.LOCAL,
         priority=_priority("local_general", 12),
@@ -210,12 +217,16 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
     "local_coding": ModelProfile(
         model_id=os.getenv(
             "LOCAL_CODING_MODEL",
-            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+            "Qwen3-Coder-30B-A3B-Instruct-4bit",
         ),
         role="executor",
         provider="omlx",
         capabilities=("coding", "tools", "shell"),
         latency_class="medium",
+        legacy_model_id=os.getenv(
+            "LEGACY_LOCAL_CODING_MODEL",
+            f"{OMLX_MODELS_DIR}/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+        ),
         capability=Capability.STRONG,
         access_class=AccessClass.LOCAL,
         priority=_priority("local_coding", 10),
@@ -226,7 +237,7 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
     "splash_local": ModelProfile(
         model_id="incoai/Qwen3.8-27B-Splash",
         role="executor",
-        provider=os.getenv("SPLASH_PROVIDER", "openai"),
+        provider=os.getenv("SPLASH_PROVIDER", "splash-local"),
         capabilities=("general", "coding", "reasoning", "tools"),
         latency_class="medium",
         capability=Capability.STRONG,
@@ -246,47 +257,45 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
     # provider in models.json), never through this router's /api/execute.
     # local_reasoning falls back to local_general below until mlx_lm ships
     # native qwen3_5_moe support.
-    # ---- GitHub Copilot (single provider, single seat) ----
-    # All executor models below are served through the GitHub Copilot API
-    # (provider "github-copilot", see ~/.pi/agent/models-store.json for the
-    # live catalogue). Verified by decoding the live Copilot token's claims
-    # (~/.pi/agent/auth.json): sku="copilot_enterprise_seat_quota" - there is
-    # NO unlimited tier on this seat. Every model draws against the same
-    # metered enterprise quota, just at very different per-model multipliers
-    # (reflected here by the $/M-token notes). All profiles are therefore
-    # billing="subscription_quota" (registry: access_class=subscription);
-    # ordering within each tier still puts the
-    # cheapest/lowest-multiplier models first to conserve quota.
+    # ---- Pi subscription providers ----
+    # Provider/model pairs must exactly match Pi's model registry because the
+    # extension resolves candidates with modelRegistry.find(provider, model).
+    # GPT subscription models are exposed by openai-codex and Gemini by
+    # antigravity on this installation. Anthropic-backed profiles are
+    # intentionally not registered; use the OpenRouter/Gemini routes
+    # configured in the host instead. Profiles absent from that registry are
+    # omitted rather than retained as stale disabled entries.
+    # Ordering within each capability group keeps cheaper/faster models first.
 
     # -- cheap / fast (routine work, treated as effectively unlimited) --
     "gpt_6_luna": ModelProfile(
         model_id="gpt-6-luna",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
         capability=Capability.NORMAL,
         access_class=AccessClass.SUBSCRIPTION,
         priority=_priority("gpt_6_luna", 10),
         supports_tools=True,
-        notes="GPT-6 Luna via GitHub Copilot ($0.10 / $0.50) - cheapest general/coding model",
+        notes="GPT-6 Luna via Pi's OpenAI Codex subscription provider",
     ),
     "gpt_5_6_luna": ModelProfile(
         model_id="gpt-5.6-luna",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("general", "coding", "tools"),
         latency_class="fast",
         capability=Capability.NORMAL,
         access_class=AccessClass.SUBSCRIPTION,
         priority=_priority("gpt_5_6_luna", 12),
         supports_tools=True,
-        notes="GPT-5.6 Luna via GitHub Copilot ($0.20 / $1.20)",
+        notes="GPT-5.6 Luna via Pi's OpenAI Codex subscription provider",
     ),
     "gemini_3_8_flash": ModelProfile(
         model_id="gemini-3.8-flash",
         role="executor",
-        provider="github-copilot",
+        provider="antigravity",
         capabilities=("general", "coding", "tools", "research"),
         latency_class="fast",
         capability=Capability.NORMAL,
@@ -294,187 +303,63 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
         priority=_priority("gemini_3_8_flash", 14),
         context_limit=1_000_000,
         supports_tools=True,
-        notes="Gemini 3.8 Flash via GitHub Copilot ($0.75 / $3.75, 1M context)",
-    ),
-    "gpt_5_mini": ModelProfile(
-        model_id="gpt-5-mini",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "tools"),
-        latency_class="fast",
-        capability=Capability.NORMAL,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("gpt_5_mini", 16),
-        supports_tools=True,
-        notes="GPT-5 Mini via GitHub Copilot ($0.25 / $2.00)",
-    ),
-    "claude_haiku_4_5": ModelProfile(
-        model_id="claude-haiku-4.5",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "tools"),
-        latency_class="fast",
-        capability=Capability.NORMAL,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("claude_haiku_4_5", 18),
-        supports_tools=True,
-        notes="Claude Haiku 4.5 via GitHub Copilot ($1.00 / $5.00)",
-    ),
-    "mai_code_1_1_flash": ModelProfile(
-        model_id="mai-code-1.1-flash",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("coding", "tools"),
-        latency_class="fast",
-        capability=Capability.NORMAL,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("mai_code_1_1_flash", 20),
-        supports_tools=True,
-        notes="MAI-Code-1.1-Flash via GitHub Copilot ($0.20 / $1.20)",
+        notes="Gemini 3.8 Flash via Pi's Antigravity provider (1M context)",
     ),
 
     # -- coding specialists (moderate cost, reserve for real code work) --
     "gpt_5_3_codex": ModelProfile(
-        model_id="gpt-5.3-codex",
+        model_id="gpt-5.6-sol",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("coding", "tools", "reasoning"),
         latency_class="medium",
         capability=Capability.STRONG,
         access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("gpt_5_3_codex", 10),
+        priority=_priority("gpt_5_3_codex", 99),
         supports_tools=True,
-        notes="GPT-5.3 Codex via GitHub Copilot ($1.75 / $14.00) - purpose-built coding model",
-    ),
-    "kimi_k2_7_code": ModelProfile(
-        model_id="kimi-k2.7-code",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("coding", "tools"),
-        latency_class="medium",
-        capability=Capability.STRONG,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("kimi_k2_7_code", 12),
-        supports_tools=True,
-        notes="Kimi K2.7 Code via GitHub Copilot ($0.95 / $4.00)",
-    ),
-    "mai_code_1_flash": ModelProfile(
-        model_id="mai-code-1-flash-picker",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("coding", "tools"),
-        latency_class="medium",
-        capability=Capability.STRONG,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("mai_code_1_flash", 14),
-        supports_tools=True,
-        notes="MAI-Code-1-Flash via GitHub Copilot ($0.75 / $4.50)",
+        notes="Manual-override compatibility alias for GPT-5.6 Sol; the canonical profile wins automatic deduplication",
     ),
 
     # -- general reasoning / balanced (subscription quota) --
-    "claude_sonnet_5": ModelProfile(
-        model_id="claude-sonnet-5",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="fast",
-        capability=Capability.STRONG,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("claude_sonnet_5", 10),
-        supports_tools=True,
-        notes="Claude Sonnet 5 via GitHub Copilot ($2.00 / $10.00)",
-    ),
-    "grok_4_7": ModelProfile(
-        model_id="grok-4.7",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "reasoning", "tools"),
-        latency_class="medium",
-        capability=Capability.STRONG,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("grok_4_7", 12),
-        supports_tools=True,
-        notes="Grok 4.7 via GitHub Copilot ($2.00 / $6.00)",
-    ),
     "gpt_5_6_sol": ModelProfile(
         model_id="gpt-5.6-sol",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="fast",
         capability=Capability.STRONG,
         access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("gpt_5_6_sol", 14),
+        priority=_priority("gpt_5_6_sol", 20),
         supports_tools=True,
-        notes="GPT-5.6 Sol via GitHub Copilot ($4.00 / $20.00)",
+        notes="GPT-5.6 Sol via Pi's OpenAI Codex subscription provider",
     ),
 
     # -- deep reasoning / flagship (expensive, reserve for high failure cost) --
     "gpt_5_6_terra": ModelProfile(
         model_id="gpt-5.6-terra",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
         capability=Capability.REASONING,
         access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("gpt_5_6_terra", 10),
+        priority=_priority("gpt_5_6_terra", 30),
         supports_tools=True,
         supports_thinking=True,
-        notes="GPT-5.6 Terra via GitHub Copilot ($2.00 / $12.00) - deep reasoning",
-    ),
-    "claude_opus_5_5": ModelProfile(
-        model_id="claude-opus-5.5",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="slow",
-        capability=Capability.REASONING,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("claude_opus_5_5", 12),
-        supports_tools=True,
-        supports_thinking=True,
-        notes="Claude Opus 5.5 via GitHub Copilot ($4.00 / $20.00)",
-    ),
-    "claude_opus_5": ModelProfile(
-        model_id="claude-opus-5",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "coding", "reasoning", "research", "tools"),
-        latency_class="slow",
-        capability=Capability.REASONING,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("claude_opus_5", 14),
-        supports_tools=True,
-        supports_thinking=True,
-        notes="Claude Opus 5 via GitHub Copilot ($5.00 / $25.00)",
+        notes="GPT-5.6 Terra via Pi's OpenAI Codex subscription provider",
     ),
     "gpt_6_astra": ModelProfile(
         model_id="gpt-6-astra",
         role="executor",
-        provider="github-copilot",
+        provider="openai-codex",
         capabilities=("general", "coding", "reasoning", "research", "tools"),
         latency_class="slow",
         capability=Capability.REASONING,
         access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("gpt_6_astra", 16),
+        priority=_priority("gpt_6_astra", 32),
         supports_tools=True,
         supports_thinking=True,
-        notes="GPT-6 Astra via GitHub Copilot ($10.00 / $50.00) - flagship",
-    ),
-    "claude_fable_5_1": ModelProfile(
-        model_id="claude-fable-5.1",
-        role="executor",
-        provider="github-copilot",
-        capabilities=("general", "reasoning", "research", "tools"),
-        latency_class="slow",
-        capability=Capability.REASONING,
-        access_class=AccessClass.SUBSCRIPTION,
-        priority=_priority("claude_fable_5_1", 18),
-        context_limit=1_000_000,
-        supports_tools=True,
-        supports_thinking=True,
-        notes="Claude Fable 5.1 via GitHub Copilot ($10.00 / $50.00, 1M context) - long-context research",
+        notes="GPT-6 Astra via Pi's OpenAI Codex subscription provider",
     ),
 
     # ---- metered examples (DISABLED by default) ----
@@ -500,7 +385,7 @@ def _build_model_profiles() -> dict[str, ModelProfile]:
     ),
     "premium_fallback": ModelProfile(
         model_id=os.getenv(
-            "ROUTER_METERED_EXPENSIVE_MODEL", "anthropic/claude-opus-4.5"
+            "ROUTER_METERED_EXPENSIVE_MODEL", "z-ai/glm-5.3"
         ),
         role="executor",
         provider=os.getenv(
@@ -723,16 +608,16 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         name="cloud_standard",
         is_local=False,
         minimum_capability="general",
-        preferred_model_profiles=("gpt_6_luna", "gpt_5_6_luna", "gemini_3_8_flash", "gpt_5_mini", "claude_haiku_4_5"),
+        preferred_model_profiles=("gpt_6_luna", "gpt_5_6_luna", "gemini_3_8_flash"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
-        notes="General tasks that benefit from a stronger model (cheap Copilot models)",
+        notes="General tasks that benefit from a stronger subscription model",
     ),
     "cloud_coding": TierDefinition(
         name="cloud_coding",
         is_local=False,
         minimum_capability="coding",
-        preferred_model_profiles=("gpt_5_3_codex", "kimi_k2_7_code", "mai_code_1_1_flash", "claude_sonnet_5", "gpt_5_6_sol", "gpt_6_astra"),
+        preferred_model_profiles=("gpt_5_6_sol", "gpt_6_astra"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
         notes="Complex refactors, unfamiliar frameworks, high-stakes code",
@@ -741,7 +626,7 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         name="cloud_reasoning",
         is_local=False,
         minimum_capability="general",
-        preferred_model_profiles=("claude_opus_5_5", "gpt_5_6_terra", "gpt_6_astra", "claude_opus_5", "claude_sonnet_5", "gpt_5_6_sol"),
+        preferred_model_profiles=("gpt_5_6_terra", "gpt_6_astra", "gpt_5_6_sol"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
         notes="Adversarial reasoning, deep architecture, high failure cost",
@@ -750,7 +635,7 @@ TIER_DEFINITIONS: dict[str, TierDefinition] = {
         name="cloud_research",
         is_local=False,
         minimum_capability="research",
-        preferred_model_profiles=("claude_fable_5_1", "gpt_6_astra", "gemini_3_8_flash", "gpt_5_6_sol"),
+        preferred_model_profiles=("gpt_6_astra", "gemini_3_8_flash", "gpt_5_6_sol"),
         supports_tools=("shell", "read_only", "browser"),
         supports_web=True,
         notes="Tasks requiring current web data, long context, or external sources",

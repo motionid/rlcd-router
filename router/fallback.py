@@ -36,6 +36,24 @@ def recommend_subscription_fallback(
     if exhausted_model in ordered:
         ordered = ordered[ordered.index(exhausted_model) + 1 :]
 
+    # Compatibility aliases can share an exact executor. Never recommend the
+    # exhausted provider/model again under a different profile name, and keep
+    # only the first occurrence of every remaining provider/model pair.
+    exhausted_key = None
+    if exhausted_model in MODEL_PROFILES:
+        exhausted = MODEL_PROFILES[exhausted_model]
+        exhausted_key = (exhausted.provider, exhausted.model_id)
+    seen = {exhausted_key} if exhausted_key is not None else set()
+    unique: list[str] = []
+    for name in ordered:
+        profile = MODEL_PROFILES[name]
+        key = (profile.provider, profile.model_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(name)
+    ordered = unique
+
     recommendation = ordered[0] if ordered else None
     alternatives = [_model_option(name) for name in ordered[1:]]
     return {

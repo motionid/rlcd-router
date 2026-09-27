@@ -1,0 +1,8 @@
+{
+  "name": "rlcd-router-pi-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:extension": "node --test tests/test_pi_extension_state.mjs tests/test_pi_extension_behavior.mjs"
+  }
+}

@@ -4,20 +4,30 @@ from router.fallback import recommend_subscription_fallback
 
 def test_recommends_next_eligible_model_after_subscription_exhaustion():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_5", "gpt_5_6_sol", "local_coding"),
-        exhausted_model="claude_sonnet_5",
+        eligible_models=("gpt_5_3_codex", "gpt_6_astra", "local_coding"),
+        exhausted_model="gpt_5_3_codex",
     )
 
     assert result["reason"] == "subscription_exhausted"
-    assert result["recommended_model"] == "gpt_5_6_sol"
+    assert result["recommended_model"] == "gpt_6_astra"
     assert [item["profile_name"] for item in result["alternatives"]] == ["local_coding"]
     assert result["can_override"] is True
 
 
+def test_does_not_retry_same_provider_model_through_compatibility_alias():
+    result = recommend_subscription_fallback(
+        eligible_models=("gpt_5_3_codex", "gpt_5_6_sol", "gpt_6_astra"),
+        exhausted_model="gpt_5_3_codex",
+    )
+
+    assert result["recommended_model"] == "gpt_6_astra"
+    assert result["alternatives"] == []
+
+
 def test_does_not_recommend_the_exhausted_model_or_classifiers():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_5", "rlcd_smart", "local_coding"),
-        exhausted_model="claude_sonnet_5",
+        eligible_models=("gpt_5_6_sol", "rlcd_smart", "local_coding"),
+        exhausted_model="gpt_5_6_sol",
     )
 
     assert result["recommended_model"] == "local_coding"
@@ -36,8 +46,8 @@ def test_subscription_exhaustion_is_an_escalation_signal():
 
 def test_returns_no_recommendation_when_no_models_remain():
     result = recommend_subscription_fallback(
-        eligible_models=("claude_sonnet_5",),
-        exhausted_model="claude_sonnet_5",
+        eligible_models=("gpt_5_6_sol",),
+        exhausted_model="gpt_5_6_sol",
     )
 
     assert result["recommended_model"] is None

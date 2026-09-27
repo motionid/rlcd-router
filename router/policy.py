@@ -131,6 +131,7 @@ EXCL_LOCAL_ONLY = "local_only_blocks_remote"
 EXCL_UNAVAILABLE = "unavailable_cooldown"
 EXCL_PAID_UNCERTAIN = "paid_excluded_uncertain"
 EXCL_ACCESS_ORDER = "access_class_excluded"
+EXCL_DUPLICATE_MODEL = "duplicate_provider_model"
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +181,12 @@ def build_route(
     # -- 1. hard filtering (before any ordering) --------------------------
     eligible: list[tuple[str, ModelProfile]] = []
     excluded: list[CandidateExclusion] = []
+    unavailable_pairs = unavailable_provider_models(profiles, availability)
 
     for name, profile in profiles.items():
         reason = _hard_filter(
             name, profile, required, requirements,
-            uncertain, availability, access_order,
+            uncertain, availability, access_order, unavailable_pairs,
         )
         if reason is None:
             eligible.append((name, profile))
@@ -193,11 +195,13 @@ def build_route(
 
     # -- 2./3. access-group ordering, then numeric priority -----------------
     ordered = _order(eligible, access_rank)
+    ordered, duplicates = _deduplicate_provider_models(ordered)
+    excluded.extend(duplicates)
 
     # -- safe fallback ------------------------------------------------------
     if not ordered:
         fallback = _safe_subscription_default(
-            profiles, availability, requirements
+            profiles, availability, requirements, unavailable_pairs
         )
         if fallback is not None:
             ordered = [fallback]
@@ -238,6 +242,22 @@ def build_route(
 # Filtering helpers
 # ---------------------------------------------------------------------------
 
+def unavailable_provider_models(
+    profiles: Mapping[str, ModelProfile],
+    availability: AvailabilityStore,
+) -> set[tuple[str, str]]:
+    """Return exact provider/model pairs with any profile in cooldown.
+
+    Compatibility aliases share provider quota and availability with their
+    canonical profile. A cooldown on either name therefore blocks the pair.
+    """
+    return {
+        (profile.provider, profile.model_id)
+        for name, profile in profiles.items()
+        if not availability.is_available(name)
+    }
+
+
 def _hard_filter(
     name: str,
     profile: ModelProfile,
@@ -246,6 +266,7 @@ def _hard_filter(
     uncertain: bool,
     availability: AvailabilityStore,
     access_order: tuple[AccessClass, ...],
+    unavailable_pairs: set[tuple[str, str]] | None = None,
 ) -> str | None:
     """Return the exclusion reason for ``profile``, or None if eligible.
 
@@ -270,7 +291,11 @@ def _hard_filter(
         return EXCL_PAID_UNCERTAIN
     if profile.access_class not in access_order:
         return EXCL_ACCESS_ORDER
-    if not availability.is_available(name):
+    if (
+        not availability.is_available(name)
+        or unavailable_pairs is not None
+        and (profile.provider, profile.model_id) in unavailable_pairs
+    ):
         return EXCL_UNAVAILABLE
     return None
 
@@ -290,10 +315,39 @@ def _order(
     )
 
 
+def _deduplicate_provider_models(
+    ordered: list[tuple[str, ModelProfile]],
+) -> tuple[list[tuple[str, ModelProfile]], list[CandidateExclusion]]:
+    """Keep the first ordered profile for each exact provider/model pair.
+
+    Compatibility aliases may intentionally share an executor. Retrying the
+    same provider/model under another profile cannot recover an availability
+    failure, so duplicate pairs are excluded before the candidate cursor is
+    constructed.
+    """
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, ModelProfile]] = []
+    excluded: list[CandidateExclusion] = []
+    for name, profile in ordered:
+        key = (profile.provider, profile.model_id)
+        if key in seen:
+            excluded.append(
+                CandidateExclusion(
+                    profile_id=name,
+                    reason=EXCL_DUPLICATE_MODEL,
+                )
+            )
+            continue
+        seen.add(key)
+        unique.append((name, profile))
+    return unique, excluded
+
+
 def _safe_subscription_default(
     profiles: Mapping[str, ModelProfile],
     availability: AvailabilityStore,
     requirements: RouteRequirements,
+    unavailable_pairs: set[tuple[str, str]] | None = None,
 ) -> tuple[str, ModelProfile] | None:
     """Safe fallback when no candidate survived filtering.
 
@@ -319,6 +373,11 @@ def _safe_subscription_default(
         if requirements.local_only and profile.access_class is not AccessClass.LOCAL:
             continue
         if not availability.is_available(name):
+            continue
+        if (
+            unavailable_pairs is not None
+            and (profile.provider, profile.model_id) in unavailable_pairs
+        ):
             continue
         if profile.access_class is not preferred:
             continue

@@ -50,11 +50,13 @@ def _profile(
     tools: bool = False,
     thinking: bool = False,
     context_limit: int = 128_000,
+    provider: str = "synthetic",
+    model_id: str | None = None,
 ) -> ModelProfile:
     return ModelProfile(
-        model_id=f"model-{profile_id}",
+        model_id=model_id or f"model-{profile_id}",
         role=role,
-        provider="synthetic",
+        provider=provider,
         capabilities=(),
         latency_class="fast",
         capability=capability,
@@ -194,6 +196,31 @@ class TestCapabilityAccessOrder:
         assert _ids(decision) == ["sub_reasoning", "metered_reasoning"]
         assert _excluded(decision, "sub_strong") == "insufficient_capability"
 
+    def test_duplicate_provider_model_pair_is_returned_only_once(self):
+        profiles = {
+            "compat_alias": _profile(
+                "compat_alias",
+                capability=Capability.STRONG,
+                priority=10,
+                provider="openai-codex",
+                model_id="gpt-5.6-sol",
+            ),
+            "canonical": _profile(
+                "canonical",
+                capability=Capability.STRONG,
+                priority=20,
+                provider="openai-codex",
+                model_id="gpt-5.6-sol",
+            ),
+        }
+
+        decision = build_route(
+            _classification(Capability.STRONG), profiles, _store()
+        )
+
+        assert _ids(decision) == ["compat_alias"]
+        assert _excluded(decision, "canonical") == "duplicate_provider_model"
+
 
 # ---------------------------------------------------------------------------
 # Availability interaction
@@ -215,6 +242,41 @@ class TestAvailability:
         )
         assert _ids(decision)[0] == "sub_second"
         assert _excluded(decision, "sub_first") == "unavailable_cooldown"
+
+    def test_cooldown_blocks_every_alias_for_same_provider_model(self):
+        store = _store()
+        store.record_failure("canonical", FailureCategory.QUOTA)
+        profiles = {
+            "canonical": _profile(
+                "canonical",
+                capability=Capability.STRONG,
+                priority=10,
+                provider="openai-codex",
+                model_id="gpt-5.6-sol",
+            ),
+            "compat_alias": _profile(
+                "compat_alias",
+                capability=Capability.STRONG,
+                priority=99,
+                provider="openai-codex",
+                model_id="gpt-5.6-sol",
+            ),
+            "next_model": _profile(
+                "next_model",
+                capability=Capability.STRONG,
+                priority=20,
+                provider="openai-codex",
+                model_id="gpt-6-astra",
+            ),
+        }
+
+        decision = build_route(
+            _classification(Capability.STRONG), profiles, store
+        )
+
+        assert _ids(decision) == ["next_model"]
+        assert _excluded(decision, "canonical") == "unavailable_cooldown"
+        assert _excluded(decision, "compat_alias") == "unavailable_cooldown"
 
     def test_all_subscriptions_unavailable_uses_metered_cheap(self):
         store = _store()

@@ -24,6 +24,8 @@ from router.config import (
     Capability,
     MODEL_PROFILES,
     ModelProfile,
+    TIER_DEFINITIONS,
+    _build_model_profiles,
     executor_candidates,
 )
 from router.decision import (
@@ -288,14 +290,81 @@ class TestCapabilityAccessRegistry:
         assert MODEL_PROFILES["gpt_6_luna"].capability is Capability.NORMAL
         assert MODEL_PROFILES["gpt_6_luna"].access_class is AccessClass.SUBSCRIPTION
         assert MODEL_PROFILES["gpt_5_3_codex"].capability is Capability.STRONG
-        assert MODEL_PROFILES["claude_sonnet_5"].capability is Capability.STRONG
-        assert MODEL_PROFILES["claude_sonnet_5"].access_class is AccessClass.SUBSCRIPTION
-        assert MODEL_PROFILES["claude_opus_5"].capability is Capability.REASONING
-        assert MODEL_PROFILES["claude_opus_5"].access_class is AccessClass.SUBSCRIPTION
+        assert MODEL_PROFILES["gpt_5_3_codex"].provider == "openai-codex"
+        assert MODEL_PROFILES["gpt_5_3_codex"].model_id == "gpt-5.6-sol"
+        assert MODEL_PROFILES["gpt_5_6_sol"].capability is Capability.STRONG
+        assert MODEL_PROFILES["gpt_5_6_sol"].access_class is AccessClass.SUBSCRIPTION
+        assert MODEL_PROFILES["gpt_5_6_terra"].capability is Capability.REASONING
+        assert MODEL_PROFILES["gpt_5_6_terra"].access_class is AccessClass.SUBSCRIPTION
 
     def test_registry_priorities_are_positive_ints(self):
         for name, profile in MODEL_PROFILES.items():
             assert isinstance(profile.priority, int) and profile.priority > 0, name
+
+    def test_anthropic_provider_is_removed_from_router_registry(self):
+        assert all(
+            profile.provider != "anthropic"
+            for profile in MODEL_PROFILES.values()
+        )
+        for tier in TIER_DEFINITIONS.values():
+            assert all(
+                MODEL_PROFILES[name].provider != "anthropic"
+                for name in tier.preferred_model_profiles
+                if name in MODEL_PROFILES
+            )
+
+    def test_unavailable_legacy_subscription_profiles_are_removed(self):
+        removed = {
+            "gpt_5_mini",
+            "mai_code_1_1_flash",
+            "kimi_k2_7_code",
+            "mai_code_1_flash",
+            "grok_4_7",
+            "claude_opus_5_5",
+        }
+        assert removed.isdisjoint(MODEL_PROFILES)
+        for tier in TIER_DEFINITIONS.values():
+            assert removed.isdisjoint(tier.preferred_model_profiles)
+
+    def test_enabled_executor_defaults_resolve_in_pi_registry(self, monkeypatch):
+        """Shipped defaults must name provider/model pairs Pi can activate.
+
+        This fixture mirrors the installed Pi registry seams used by this
+        machine: built-in providers plus the dynamic oMLX and Splash
+        extensions.  A stale provider alias (for example ``github-copilot``)
+        makes every candidate fail before ``pi.setModel`` is called.
+        """
+        pi_models = {
+            ("omlx", "Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            ("omlx", "Qwen3.8-27B-MLX-4bit"),
+            ("splash-local", "incoai/Qwen3.8-27B-Splash"),
+            ("openai-codex", "gpt-5.3-codex-spark"),
+            ("openai-codex", "gpt-5.6-luna"),
+            ("openai-codex", "gpt-5.6-sol"),
+            ("openai-codex", "gpt-5.6-terra"),
+            ("openai-codex", "gpt-6-astra"),
+            ("openai-codex", "gpt-6-luna"),
+            ("antigravity", "gemini-3.8-flash"),
+        }
+
+        # Validate declared defaults, not ambient shell overrides used for a
+        # deliberate local deployment customization.
+        for key in tuple(os.environ):
+            if key.startswith(("ROUTER_ENABLE_", "ROUTER_DISABLE_")) or key in {
+                "LOCAL_GENERAL_MODEL",
+                "LOCAL_CODING_MODEL",
+                "SPLASH_PROVIDER",
+            }:
+                monkeypatch.delenv(key, raising=False)
+        default_profiles = _build_model_profiles()
+
+        unresolved = {
+            name: (profile.provider, profile.model_id)
+            for name, profile in executor_candidates(default_profiles).items()
+            if (profile.provider, profile.model_id) not in pi_models
+        }
+
+        assert unresolved == {}
 
 
 class TestCandidateRecords:

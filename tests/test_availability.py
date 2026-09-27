@@ -110,18 +110,18 @@ class TestCooldownRecording:
 
     def test_quota_uses_medium_cooldown(self):
         store, clock = make_store()
-        record = store.record_failure("claude_sonnet_5", FailureCategory.QUOTA)
+        record = store.record_failure("gpt_5_6_sol", FailureCategory.QUOTA)
 
         assert record.cooldown_until == clock.now + COOLDOWN_CONFIG.quota
         assert COOLDOWN_CONFIG.quota > COOLDOWN_CONFIG.rate_limit
 
     def test_auth_and_capacity_use_configured_cooldowns(self):
         store, clock = make_store()
-        auth = store.record_failure("claude_opus_5", FailureCategory.AUTH)
+        auth = store.record_failure("gpt_5_6_terra", FailureCategory.AUTH)
         assert auth.cooldown_until == clock.now + COOLDOWN_CONFIG.auth
 
         capacity = store.record_failure(
-            "claude_opus_5", FailureCategory.CAPACITY
+            "gpt_5_6_terra", FailureCategory.CAPACITY
         )
         assert capacity.cooldown_until == clock.now + COOLDOWN_CONFIG.capacity
 
@@ -155,17 +155,17 @@ class TestCooldownRecording:
 class TestCooldownBoundary:
     def test_subscription_is_excluded_before_cooldown_boundary(self):
         store, clock = make_store()
-        store.record_failure("claude_sonnet_5", FailureCategory.QUOTA)
+        store.record_failure("gpt_5_6_sol", FailureCategory.QUOTA)
 
         clock.advance(COOLDOWN_CONFIG.quota - 0.001)
-        assert store.is_available("claude_sonnet_5") is False
+        assert store.is_available("gpt_5_6_sol") is False
 
     def test_subscription_is_eligible_at_cooldown_boundary(self):
         store, clock = make_store()
-        store.record_failure("claude_sonnet_5", FailureCategory.QUOTA)
+        store.record_failure("gpt_5_6_sol", FailureCategory.QUOTA)
 
         clock.advance(COOLDOWN_CONFIG.quota)
-        assert store.is_available("claude_sonnet_5") is True
+        assert store.is_available("gpt_5_6_sol") is True
 
     def test_unknown_profile_is_available(self):
         store, _ = make_store()
@@ -253,12 +253,12 @@ class TestRecovery:
     def test_snapshot_exposes_all_records(self):
         store, _ = make_store()
         store.record_failure("gpt_6_luna", FailureCategory.RATE_LIMIT)
-        store.record_success("claude_sonnet_5")
+        store.record_success("gpt_5_6_sol")
 
         snap = store.snapshot()
-        assert set(snap) == {"gpt_6_luna", "claude_sonnet_5"}
+        assert set(snap) == {"gpt_6_luna", "gpt_5_6_sol"}
         assert snap["gpt_6_luna"].reason == FailureCategory.RATE_LIMIT
-        assert snap["claude_sonnet_5"].status == "available"
+        assert snap["gpt_5_6_sol"].status == "available"
 
     def test_records_serialize_to_plain_values(self):
         store, _ = make_store()

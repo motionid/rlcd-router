@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+import warnings
 from collections import OrderedDict
 from dataclasses import replace
 from typing import Dict, Any, Optional
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # --- production router interfaces (no MLX, no network required) ---
 from router.availability import (
+    AVAILABILITY_CATEGORIES,
     AvailabilityRecord,
     AvailabilityStore,
     FailureCategory,
@@ -37,13 +39,13 @@ from router.policy import (
     _hard_filter,
     build_route,
     choose_route,
+    unavailable_provider_models,
 )
 
 # --- legacy router interfaces (kept during migration) ---
 from router.router_schema import ROUTER_SCHEMA
 from router.signals import TurnContext, extract_signals
 from router.classifier import RouterClassifier, bypass_classification
-from router.policy import choose_route
 from router.telemetry import TelemetryLog
 from router.fallback import recommend_subscription_fallback
 
@@ -152,6 +154,20 @@ def _availability_snapshot() -> Dict[str, Dict[str, Any]]:
         profile_id: record.to_dict()
         for profile_id, record in _get_availability_store().snapshot().items()
     }
+
+
+def _same_executor_pair_profiles(profile_id: str) -> tuple[str, ...]:
+    """All executor profile names sharing ``profile_id``'s provider/model."""
+    profile = MODEL_PROFILES.get(profile_id)
+    if profile is None or profile.role != "executor":
+        return (profile_id,)
+    pair = (profile.provider, profile.model_id)
+    return tuple(
+        name
+        for name, candidate in MODEL_PROFILES.items()
+        if candidate.role == "executor"
+        and (candidate.provider, candidate.model_id) == pair
+    )
 
 
 # Bounded in-memory route outcome index.  Outcome reporting must never
@@ -592,7 +608,11 @@ def _route_request(req: RouteRequest) -> Dict[str, Any]:
                        f"Available: {', '.join(executor_profiles)}",
             )
 
-        available = store.is_available(name)
+        unavailable_pairs = unavailable_provider_models(MODEL_PROFILES, store)
+        available = (
+            store.is_available(name)
+            and (profile.provider, profile.model_id) not in unavailable_pairs
+        )
         incompatibility = None
         if available:
             # The override must satisfy the caller's actual hard
@@ -600,7 +620,7 @@ def _route_request(req: RouteRequest) -> Dict[str, Any]:
             # available but incompatible override is NOT returned.
             reason = _hard_filter(
                 name, profile, Capability.BASIC, requirements,
-                False, store, (profile.access_class,),
+                False, store, (profile.access_class,), unavailable_pairs,
             )
             if reason == EXCL_UNAVAILABLE:
                 # Cooldown raced in: treat exactly like an unavailable
@@ -745,12 +765,13 @@ def _fallback_profile(
     # only when it passes the same hard filter — an unknown, disabled,
     # cooled-down, or otherwise ineligible pin is never fabricated and
     # automatic resolution takes over.
+    unavailable_pairs = unavailable_provider_models(MODEL_PROFILES, store)
     pinned = os.getenv("ROUTER_SAFE_FALLBACK_PROFILE", "").strip()
     if pinned and pinned in MODEL_PROFILES:
         pinned_profile = MODEL_PROFILES[pinned]
         if _hard_filter(
             pinned, pinned_profile, capability, requirements,
-            True, store, (preferred,),
+            True, store, (preferred,), unavailable_pairs,
         ) is None:
             return pinned, pinned_profile
     pool = []
@@ -760,6 +781,7 @@ def _fallback_profile(
             True,  # conservative: paid access is never a safe fallback
             store,
             (preferred,),
+            unavailable_pairs,
         )
         if reason is None:
             pool.append((name, profile))
@@ -978,8 +1000,15 @@ def api_report_outcome(report: OutcomeReport):
     availability = None
     if profile_name:
         store = _get_availability_store()
+        pair_profiles = _same_executor_pair_profiles(profile_name)
         if report.status == "success":
-            store.record_success(profile_name)
+            for pair_profile in pair_profiles:
+                store.record_success(pair_profile)
+        elif report.status == "failed" and category in AVAILABILITY_CATEGORIES:
+            for pair_profile in pair_profiles:
+                store.record_failure(
+                    pair_profile, category, report.retry_after
+                )
         elif report.status == "failed" and category is not None:
             store.record_failure(
                 profile_name, category, report.retry_after
@@ -1146,6 +1175,16 @@ class ExecuteRequest(BaseModel):
     system_prompt: Optional[str] = None
 
 
+def _legacy_execution_model_id(profile: Any) -> str:
+    """Return the mlx_lm identifier for deprecated local execution.
+
+    Executor ``model_id`` values belong to Pi's model registry and may be
+    bare oMLX IDs.  The legacy endpoints still call ``mlx_lm.load()``, which
+    requires a filesystem path or Hugging Face owner/repository ID.
+    """
+    return profile.legacy_model_id or profile.model_id
+
+
 @app.post("/api/execute", deprecated=True)
 def api_execute(req: ExecuteRequest, response: Response):
     """(Deprecated) Execute a task through a local model.
@@ -1179,11 +1218,15 @@ def api_execute(req: ExecuteRequest, response: Response):
         if req.model_id:
             model_id = req.model_id
         elif req.model_profile and req.model_profile in MODEL_PROFILES:
-            model_id = MODEL_PROFILES[req.model_profile].model_id
+            model_id = _legacy_execution_model_id(
+                MODEL_PROFILES[req.model_profile]
+            )
         elif req.tier in TIER_DEFINITIONS and TIER_DEFINITIONS[req.tier].is_local:
             td = TIER_DEFINITIONS[req.tier]
             if td.preferred_model_profiles and td.preferred_model_profiles[0] in MODEL_PROFILES:
-                model_id = MODEL_PROFILES[td.preferred_model_profiles[0]].model_id
+                model_id = _legacy_execution_model_id(
+                    MODEL_PROFILES[td.preferred_model_profiles[0]]
+                )
             else:
                 model_id = MODEL_ID
         else:
@@ -1261,7 +1304,7 @@ def api_route_and_execute(req: RouteAndExecuteRequest, response: Response):
 
             execution_result = None
             if td and td.is_local and profile:
-                model_id = profile.model_id
+                model_id = _legacy_execution_model_id(profile)
                 sys_prompt = req.system_prompt or TIER_SYSTEM_PROMPTS.get(tier, "")
                 exec_result = run_text_generation(
                     model_id=model_id,
@@ -1306,14 +1349,23 @@ def api_route_and_execute(req: RouteAndExecuteRequest, response: Response):
             classifier = _get_router_classifier()
             cls_result = classifier.classify(req.prompt, signals)
 
-        decision = choose_route(
-            classification=cls_result.fields,
-            signals=signals,
-            overall_confidence=cls_result.overall_confidence,
-            critical_confidence=cls_result.critical_confidence,
-            classifier_used=cls_result.classifier_used,
-            abstain=cls_result.abstain,
-        )
+        # This endpoint is itself the deprecated compatibility surface and
+        # already returns an explicit deprecation notice. Avoid emitting the
+        # lower-level adapter warning from inside that acknowledged boundary.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"choose_route\(\) is deprecated;.*",
+                category=DeprecationWarning,
+            )
+            decision = choose_route(
+                classification=cls_result.fields,
+                signals=signals,
+                overall_confidence=cls_result.overall_confidence,
+                critical_confidence=cls_result.critical_confidence,
+                classifier_used=cls_result.classifier_used,
+                abstain=cls_result.abstain,
+            )
 
         route_event = _telemetry_log.new_event(
             prompt_hash=_prompt_hash(req.prompt),
@@ -1337,7 +1389,10 @@ def api_route_and_execute(req: RouteAndExecuteRequest, response: Response):
         if decision.tier in TIER_DEFINITIONS and TIER_DEFINITIONS[decision.tier].is_local:
             td = TIER_DEFINITIONS[decision.tier]
             profile_name = td.preferred_model_profiles[0] if td.preferred_model_profiles else None
-            model_id = MODEL_PROFILES[profile_name].model_id if profile_name in MODEL_PROFILES else MODEL_ID
+            model_id = (
+                _legacy_execution_model_id(MODEL_PROFILES[profile_name])
+                if profile_name in MODEL_PROFILES else MODEL_ID
+            )
             sys_prompt = req.system_prompt or TIER_SYSTEM_PROMPTS.get(decision.tier, "")
 
             exec_result = run_text_generation(
@@ -1402,11 +1457,20 @@ def api_model_overrides():
     explicitly enabled) are not valid override choices and are not listed;
     enable a profile (ROUTER_ENABLE_<NAME>=1) to make it appear here."""
     groups: Dict[str, list] = {}
-    for name, profile in MODEL_PROFILES.items():
+    seen_pairs: set[tuple[str, str]] = set()
+    ordered_profiles = sorted(
+        MODEL_PROFILES.items(),
+        key=lambda item: (item[1].priority, item[0]),
+    )
+    for name, profile in ordered_profiles:
         if profile.role == "classifier":
             continue  # don't expose classifiers as override targets
         if not profile.enabled:
             continue  # disabled profiles are not valid override choices
+        pair = (profile.provider, profile.model_id)
+        if pair in seen_pairs:
+            continue  # one canonical override target per exact executor
+        seen_pairs.add(pair)
         billing = profile.billing
         if billing not in groups:
             groups[billing] = []

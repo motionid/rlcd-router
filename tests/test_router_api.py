@@ -218,8 +218,8 @@ class TestRouterAPI:
 
         event = app_module._telemetry_log.new_event(
             eligible_models=[
-                "claude_sonnet_5",
                 "gpt_5_6_sol",
+                "gpt_6_astra",
                 "local_coding",
             ]
         )
@@ -229,12 +229,12 @@ class TestRouterAPI:
             "event_id": event.event_id,
             "status": "failed",
             "failure_reason": "subscription_exhausted",
-            "actual_model": "claude_sonnet_5",
+            "actual_model": "gpt_5_6_sol",
         })
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["model_switch"]["recommended_model"] == "gpt_5_6_sol"
+        assert body["model_switch"]["recommended_model"] == "gpt_6_astra"
         assert body["model_switch"]["can_override"] is True
 
     def test_route_honors_explicit_model_override(self):
@@ -279,6 +279,18 @@ class TestRouterAPI:
         assert "rlcd_smart" not in profile_names
         assert "rlcd_fast" not in profile_names
 
+    def test_override_catalog_prefers_canonical_profile_for_shared_model(self):
+        resp = self.client.get("/api/models/overrides")
+        assert resp.status_code == 200
+        matching = [
+            model
+            for models in resp.json()["models"].values()
+            for model in models
+            if model["provider"] == "openai-codex"
+            and model["model_id"] == "gpt-5.6-sol"
+        ]
+        assert [model["profile_name"] for model in matching] == ["gpt_5_6_sol"]
+
     def test_route_config_exposes_catalog_invariants(self):
         import router.config as config
         assert config.MODEL_PROFILES["local_coding"].role == "executor"
@@ -295,7 +307,7 @@ class TestRouterAPI:
         assert local_coding["access_class"] == "local"
         assert local_coding["billing"] == "local"  # legacy compat retained
 
-        opus = models["claude_opus_5"]
+        opus = models["gpt_5_6_terra"]
         assert opus["capability"] == "reasoning"
         assert opus["access_class"] == "subscription"
         assert opus["billing"] == "subscription_quota"  # legacy compat retained
@@ -651,6 +663,7 @@ class TestProductionRouterAPI:
             for c in candidates
         )
         assert candidates[0]["access_class"] == "subscription"
+        assert candidates[0]["profile_id"] == "gpt_6_luna"
         assert body["decision"]["tier"] == "cloud_standard"
 
     def test_route_returns_ordered_candidates_and_exclusions(self):
@@ -673,13 +686,19 @@ class TestProductionRouterAPI:
             and profile.supports_tools
             and profile.access_class is AccessClass.SUBSCRIPTION
         ]
-        expected = [
-            name for name, _ in
-            sorted(eligible, key=lambda item: (item[1].priority, item[0]))
-        ]
+        expected = []
+        seen_models = set()
+        for name, profile in sorted(
+            eligible, key=lambda item: (item[1].priority, item[0])
+        ):
+            provider_model = (profile.provider, profile.model_id)
+            if provider_model not in seen_models:
+                expected.append(name)
+                seen_models.add(provider_model)
         assert [c["profile_id"] for c in candidates] == expected
 
         excluded = {e["profile_id"]: e["reason"] for e in decision["excluded"]}
+        assert excluded["gpt_5_3_codex"] == "duplicate_provider_model"
         assert excluded["rlcd_smart"] == "classifier_profile"
         assert excluded["rlcd_fast"] == "classifier_profile"
         assert excluded["local_coding"] == "access_class_excluded"
@@ -836,6 +855,26 @@ class TestProductionRouterAPI:
             e["profile_id"]: e["reason"] for e in body2["decision"]["excluded"]
         }
         assert excluded[profile_id] == "unavailable_cooldown"
+
+    def test_outcome_cooldown_propagates_to_same_provider_model_alias(self):
+        route = self._route(
+            "Debug the failing test suite across the repository",
+            requirements={"supports_tools": True},
+        ).json()
+        route_id = route["route_id"]
+        assert route["decision"]["candidates"][0]["profile_id"] == "gpt_5_6_sol"
+
+        resp = self.client.post("/api/route/outcome", json={
+            "event_id": route_id,
+            "status": "failed",
+            "failure_category": "quota",
+            "candidate_profile": "gpt_5_6_sol",
+        })
+        assert resp.status_code == 200
+
+        store = self.app_module._get_availability_store()
+        assert store.is_available("gpt_5_6_sol") is False
+        assert store.is_available("gpt_5_3_codex") is False
 
     def test_outcome_task_failure_updates_task_failure_not_availability(self):
         route_id, profile_id = self._first_route_candidate()
@@ -1053,13 +1092,13 @@ class TestProductionRouterAPI:
         import router.config as config
         monkeypatch.setenv("ROUTER_DISABLE_GPT_6_LUNA", "1")
         monkeypatch.setenv("ROUTER_ENABLE_OPENROUTER_QWEN", "1")
-        monkeypatch.setenv("ROUTER_PRIORITY_GPT_5_MINI", "5")
+        monkeypatch.setenv("ROUTER_PRIORITY_GPT_5_6_SOL", "5")
         built = config._build_model_profiles()
         # Disable wins, enable turns a default-disabled example on, and
         # priority stays env-tunable per profile.
         assert built["gpt_6_luna"].enabled is False
         assert built["openrouter_qwen"].enabled is True
-        assert built["gpt_5_mini"].priority == 5
+        assert built["gpt_5_6_sol"].priority == 5
         # Disabled profiles never become executor candidates.
         assert "gpt_6_luna" not in {
             name for name, profile in built.items()

@@ -89,21 +89,28 @@ serialized by [`GET /api/route/config`](#api) and
 ### The profile registry
 
 Routing configuration lives in [`router/config.py`](router/config.py) and is
-fully environment-driven (see [Configuration](#configuration)). The shipped
-registry contains:
+environment-tunable (see [Configuration](#configuration)). Provider/model
+pairs must exactly match Pi's registry. The shipped registry contains:
 
 - **OMLX/local executors** — e.g. `local_coding` (Qwen3-Coder-30B-A3B via
-  oMLX) and `local_general` (Qwen3.8-27B), model IDs pointed at oMLX's own
-  model store so weights are shared, not duplicated.
-- **Subscription executors** — GitHub Copilot seat models, ordered
-  cheapest-first within each capability group to conserve quota
-  (`gpt_6_luna`, `claude_sonnet_5`, `gpt_5_3_codex`, `claude_opus_5`, …).
+  oMLX) and `local_general` (Qwen3.8-27B), using the IDs registered by the
+  `omlx-models` Pi extension.
+- **Subscription executors** — OpenAI Codex GPT models and Antigravity
+  Gemini models. Anthropic-backed profiles are intentionally removed; use
+  OpenRouter or Gemini-hosted alternatives when Claude-family behavior is
+  needed. Profiles absent from the installed Pi registry (Kimi, MAI, Grok,
+  and unavailable model versions) are omitted rather than retained as stale
+  disabled entries.
 - **Disabled metered examples** — `openrouter_qwen` (metered-cheap
   OpenRouter/Qwen example) and `premium_fallback` (metered-expensive premium
   fallback example). Both ship `enabled=False`; see
   [Metered example profiles](#metered-example-profiles) before enabling.
 - **Classifier profiles** — `rlcd_fast` / `rlcd_smart` (RLCD models,
   evaluation-only; never executable candidates).
+
+The legacy `gpt_5_3_codex` profile remains as a manual-override compatibility
+alias for `gpt_5_6_sol`. Automatic routes and the override catalog expose only
+the canonical profile, and cooldowns apply to their shared provider/model pair.
 
 ## Manual control (Pi extension)
 
@@ -219,20 +226,21 @@ The response includes:
     "capability": "normal",
     "candidates": [
       {
-        "profile_id": "claude_sonnet_5",
-        "provider": "github-copilot",
-        "model": "claude-sonnet-5",
-        "capability": "strong",
+        "profile_id": "gpt_6_luna",
+        "provider": "openai-codex",
+        "model": "gpt-6-luna",
+        "capability": "normal",
         "access_class": "subscription",
         "priority": 10
       },
-      { "profile_id": "gpt_5_3_codex", "...": "..." }
+      { "profile_id": "gpt_5_6_luna", "...": "..." }
     ],
     "excluded": [
       {"profile_id": "rlcd_fast", "reason": "classifier_profile"},
-      {"profile_id": "rlcd_smart", "reason": "classifier_profile"}
+      {"profile_id": "rlcd_smart", "reason": "classifier_profile"},
+      {"profile_id": "gpt_5_3_codex", "reason": "duplicate_provider_model"}
     ],
-    "eligible_models": ["claude_sonnet_5", "gpt_5_3_codex", "..."],
+    "eligible_models": ["gpt_6_luna", "gpt_5_6_luna", "..."],
     "requirements": {"minimum_capability": "general", "allow_cloud": true}
   }
 }
@@ -264,7 +272,7 @@ curl -s http://127.0.0.1:8001/api/route/outcome \
     "event_id": "<route_id>",
     "status": "failed",
     "failure_category": "rate_limit",
-    "candidate_profile": "gpt_5_3_codex",
+    "candidate_profile": "gpt_6_luna",
     "retry_after": 30
   }' | python3 -m json.tool
 ```
@@ -295,14 +303,20 @@ It wires Pi's lifecycle to the router:
 ### Install
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-ln -s "$(pwd)/pi-extension/turn-router.ts" \
-  ~/.pi/agent/extensions/turn-router.ts
+# Install both files as one multi-file extension directory. Remove the old
+# single-file link first if upgrading from an earlier installation.
+rm -f ~/.pi/agent/extensions/turn-router.ts
+mkdir -p ~/.pi/agent/extensions/turn-router
+ln -sf "$(pwd)/pi-extension/turn-router.ts" \
+  ~/.pi/agent/extensions/turn-router/index.ts
+ln -sf "$(pwd)/pi-extension/router-state.ts" \
+  ~/.pi/agent/extensions/turn-router/router-state.ts
 ```
 
-Then restart Pi or run `/reload`. If you copy the extension instead of
-symlinking it, the extension resolves the router directory through its own
-real path; `run.sh` is located there for auto-start.
+Then restart Pi or run `/reload`. Keep both files together if you copy the
+extension instead of symlinking it. The extension resolves the router
+directory through its entry point's real path; `run.sh` is located there for
+auto-start.
 
 > **Migration note:** the previous extension (`rlcd-router.ts`), its
 > `/route`, `/model-override`, and `/model-exhausted` commands, and the
@@ -391,18 +405,22 @@ New integrations must use `POST /api/route` and execute through the host.
 
 ## Configuration
 
-Everything is environment-driven; nothing requires code edits.
+Priorities, enablement, local model IDs, Ollaya, cooldowns, and metered
+examples are environment-driven; shipped provider/model defaults match the
+Pi registry used by this installation.
 
 ### OMLX / local model IDs
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OMLX_MODELS_DIR` | `~/.omlx/models` | oMLX model store — local profiles default into it so weights are shared with oMLX |
+| `OMLX_MODELS_DIR` | `~/.omlx/models` | oMLX model store used by RLCD and deprecated MLX execution |
 | `RLCD_FAST_MODEL` | `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | `rlcd_fast` classifier model ID |
 | `RLCD_SMART_MODEL` | `$OMLX_MODELS_DIR/.../Qwen3-Coder-30B-A3B-Instruct-4bit` | `rlcd_smart` classifier model ID |
-| `LOCAL_GENERAL_MODEL` | `$OMLX_MODELS_DIR/.../Qwen3.8-27B-4bit` | `local_general` executor model ID |
-| `LOCAL_CODING_MODEL` | `$OMLX_MODELS_DIR/.../Qwen3-Coder-30B-A3B-Instruct-4bit` | `local_coding` executor model ID |
-| `SPLASH_PROVIDER` | `openai` | `splash_local` provider key |
+| `LOCAL_GENERAL_MODEL` | `Qwen3.8-27B-MLX-4bit` | `local_general` Pi/oMLX registry ID |
+| `LOCAL_CODING_MODEL` | `Qwen3-Coder-30B-A3B-Instruct-4bit` | `local_coding` Pi/oMLX registry ID |
+| `LEGACY_LOCAL_GENERAL_MODEL` | `$OMLX_MODELS_DIR/lmstudio-community/Qwen3.8-27B-MLX-4bit` | Filesystem path for deprecated MLX execution only |
+| `LEGACY_LOCAL_CODING_MODEL` | `$OMLX_MODELS_DIR/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | Filesystem path for deprecated MLX execution only |
+| `SPLASH_PROVIDER` | `splash-local` | `splash_local` provider key |
 
 ### Subscription / all profile enablement and priorities
 
@@ -412,7 +430,14 @@ Everything is environment-driven; nothing requires code edits.
 | `ROUTER_ENABLE_<PROFILE>` | `ROUTER_ENABLE_LOCAL_CODING=1` | Force a profile on (e.g. re-enable a metered example after configuring credentials) |
 | `ROUTER_DISABLE_<PROFILE>` | `ROUTER_DISABLE_GPT_6_LUNA=1` | Force a profile off (e.g. a suspended seat). Disable wins over enable; unset keeps the declared default |
 
-Truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
+Truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Profiles disabled
+because their provider/model pair is absent from Pi should only be re-enabled
+after their configured pair exists in Pi's model registry.
+
+> **Migration:** `LOCAL_GENERAL_MODEL` and `LOCAL_CODING_MODEL` now mean Pi
+> registry IDs, not filesystem paths. Remove old path-style exports or replace
+> them with the IDs above. Use `LEGACY_LOCAL_*` only if the deprecated MLX
+> execution endpoints need a non-default on-disk path.
 
 ### Metered example profiles
 
@@ -427,7 +452,7 @@ export ROUTER_METERED_CHEAP_MODEL="qwen/qwen3-coder"        # or your ID
 export ROUTER_METERED_CHEAP_PROVIDER="openrouter"
 export ROUTER_ENABLE_OPENROUTER_QWEN=1
 # or, for the premium fallback:
-export ROUTER_METERED_EXPENSIVE_MODEL="anthropic/claude-opus-4.5"
+export ROUTER_METERED_EXPENSIVE_MODEL="z-ai/glm-5.3"
 export ROUTER_METERED_EXPENSIVE_PROVIDER="openrouter"
 export ROUTER_ENABLE_PREMIUM_FALLBACK=1
 ```
@@ -471,7 +496,7 @@ an override choice again.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ROUTER_SAFE_FALLBACK_PROFILE` | *(unset)* | Pin the internal-error safe fallback to a profile (e.g. `claude_sonnet_5`). The pin is honored only when it passes the same hard filter (enabled, capability floor, requirements, availability, non-paid access); an ineligible or unknown pin is ignored and automatic resolution (lowest-priority eligible subscription profile) takes over |
+| `ROUTER_SAFE_FALLBACK_PROFILE` | *(unset)* | Pin the internal-error safe fallback to a profile (e.g. `gpt_5_6_sol`). The pin is honored only when it passes the same hard filter (enabled, capability floor, requirements, availability, non-paid access); an ineligible or unknown pin is ignored and automatic resolution (lowest-priority eligible subscription profile) takes over |
 
 ### Telemetry, cost estimates, and debug mode
 
@@ -541,9 +566,14 @@ tests/                  Unit, API, and replay tests
 
 ```bash
 pytest -q
+npm run test:extension
 ```
 
-The suite mocks model execution and network access — production routing
+The root `package.json` marks the Pi extension sources as ES modules and
+provides the explicit Node test command (Node does not discover these `.mjs`
+files reliably from the directory alone).
+
+The suites mock model execution and network access — production routing
 tests run without MLX and without a live Ollaya server. The one live
 Ollaya test is gated behind `OLLAYA_LIVE_TEST=1` and skips otherwise.
 Tests that do exercise the legacy MLX endpoints require `mlx`/`mlx-lm`
@@ -566,9 +596,9 @@ Tests that do exercise the legacy MLX endpoints require `mlx`/`mlx-lm`
 
 - The bundled MLX backend (evaluation/legacy endpoints) requires Apple
   Silicon; production routing does not.
-- The profile registry reflects one specific Copilot seat and local oMLX
-  installation; adjust `router/config.py` or the environment variables for
-  your environment.
+- The profile registry reflects one specific Pi provider catalog and local
+  oMLX installation; adjust `router/config.py` or the environment variables
+  for your environment.
 - Status Ollaya `health` is a static label (`disabled`/`unknown`); there is
   no per-route live probe by design.
 - Provider failures without an HTTP response are conservatively treated as

@@ -93,6 +93,22 @@ const unavailableOverrideRouteResponse = {
   override: { requested: "gpt_6_luna", available: false },
 };
 
+const liveRegistryAutoRouteResponse = {
+  route_id: "route-live-registry-1",
+  classification: { classifier: "deterministic", capability: "strong", confidence: 0.9, reasons: ["strong_signal_debug"], ambiguous: false },
+  signals: {},
+  decision: {
+    tier: "cloud_coding",
+    capability: "strong",
+    reasons: ["strong_signal_debug", "capability:strong"],
+    candidates: [
+      candidate("claude_sonnet_5", "anthropic", "claude-sonnet-5"),
+      candidate("gpt_5_3_codex", "openai-codex", "gpt-5.3-codex-spark"),
+    ],
+    excluded: [],
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Stubbed PI runtime
 // ---------------------------------------------------------------------------
@@ -119,6 +135,8 @@ function makeRuntime(router, { mode = "tui" } = {}) {
   const statuses = [];
   const catalog = {
     "omlx/qwen3.8-27b": { provider: "omlx", id: "qwen3.8-27b" },
+    "anthropic/claude-sonnet-5": { provider: "anthropic", id: "claude-sonnet-5" },
+    "openai-codex/gpt-5.3-codex-spark": { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
     "github-copilot/gpt-6-luna": { provider: "github-copilot", id: "gpt-6-luna" },
     "github-copilot/claude-sonnet-5": { provider: "github-copilot", id: "claude-sonnet-5" },
     "github-copilot/gpt-5.3-codex": { provider: "github-copilot", id: "gpt-5.3-codex" },
@@ -198,6 +216,30 @@ const routeCalls = (rt) => rt.calls.filter((c) => c.path === "/api/route");
 const outcomeCalls = (rt) => rt.calls.filter((c) => c.path === "/api/route/outcome");
 const catalogCalls = (rt) => rt.calls.filter((c) => c.path === "/api/models/overrides");
 const lastState = (rt) => rt.entries[rt.entries.length - 1].data;
+
+// ---------------------------------------------------------------------------
+// Live provider/model compatibility
+// ---------------------------------------------------------------------------
+
+maybeTest("automatic route activates a model from the live Pi provider registry", async (t) => {
+  process.env.RLCD_ROUTER_URL = "http://router.test";
+  const rt = makeRuntime({
+    "/api/route": liveRegistryAutoRouteResponse,
+  });
+  t.after(rt.restoreFetch);
+
+  await rt.emit("before_agent_start", {
+    type: "before_agent_start",
+    prompt: "Debug the authentication race and add a regression test.",
+  });
+
+  assert.deepEqual(rt.setModelCalls, ["anthropic/claude-sonnet-5"]);
+  assert.equal(lastState(rt).route.routeId, "route-live-registry-1");
+  assert.ok(
+    rt.statuses.some(([, line]) => line.includes("claude_sonnet_5")),
+    "the activated profile is visible in Pi's router status line",
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Round 2: known manual overrides reach the server's override contract

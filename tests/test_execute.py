@@ -44,7 +44,7 @@ class TestTierToModelMapping:
     def test_splash_local_profile_is_available_for_explicit_selection(self):
         profile = MODEL_PROFILES["splash_local"]
         assert profile.model_id == "incoai/Qwen3.8-27B-Splash"
-        assert profile.provider == "openai"
+        assert profile.provider == "splash-local"
         assert profile.role == "executor"
         assert profile.billing == "local"
         assert {"general", "coding", "reasoning", "tools"}.issubset(
@@ -210,8 +210,13 @@ class TestExecutionEndpointDeprecation:
         body = resp.json()
         assert body["deprecated"] is True
         assert "deprecation" in body
-        # The endpoint remains functional.
+        # The endpoint remains functional and translates the Pi/oMLX registry
+        # ID back to the local filesystem path required by mlx_lm.load().
         assert body["text"] == _MOCK_TEXT_RESULT["text"]
+        assert os.path.isabs(body["model_id"])
+        assert body["model_id"].endswith(
+            "/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+        )
 
     def test_route_and_execute_response_signals_deprecation(self):
         resp = self.client.post("/api/route-and-execute", json={
@@ -224,6 +229,7 @@ class TestExecutionEndpointDeprecation:
         assert body["deprecated"] is True
         assert "deprecation" in body
         assert body["execution"] is not None
+        assert os.path.isabs(body["execution"]["model_id"])
 
     def test_route_and_execute_override_path_signals_deprecation(self):
         resp = self.client.post("/api/route-and-execute", json={
