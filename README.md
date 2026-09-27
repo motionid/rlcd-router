@@ -190,6 +190,11 @@ curl http://127.0.0.1:8001/health
 # {"status":"ok","service":"rlcd-router"}
 ```
 
+For an agent-guided install on another machine, see
+[`docs/setup-work-machine.md`](docs/setup-work-machine.md). It includes
+machine-specific Pi model checks and safeguards for credentials, paid models,
+and existing configuration.
+
 ## Quick start
 
 Route a task:
